@@ -50,6 +50,10 @@ function createApp(db) {
     open_ports: parseJson(d.open_ports, []), snmp: parseJson(d.snmp), is_gateway: !!d.is_gateway,
     managed_server_id: d.managed_server_id, status: d.status, first_seen: d.first_seen, last_seen: d.last_seen,
   });
+  const publicAssessment = (a) => a && ({
+    id: a.id, server_id: a.server_id, score: a.score, counts: parseJson(a.counts, {}),
+    findings: parseJson(a.findings, []), inventory: parseJson(a.inventory), created_at: a.created_at,
+  });
   const publicTask = (t, { full = false } = {}) => t && ({
     id: t.id, server_id: t.server_id, action: t.action, title: ACTIONS[t.action]?.title, params: parseJson(t.params, {}),
     status: t.status, created_by: t.created_by, created_at: t.created_at, dispatched_at: t.dispatched_at,
@@ -554,6 +558,73 @@ function createApp(db) {
     return { task: publicTask(await one('SELECT * FROM tasks WHERE id = ?', id)), scanner_server_id: scanner.id };
   });
 
+  // ------------------------------------------------------------------ security assessments & report
+  r.get('/api/assessments', requireUser(), async (req, ctx) => {
+    const servers = await all('SELECT id, name, platform, status FROM servers WHERE org_id = ? ORDER BY name', ctx.orgId);
+    const rows = await all('SELECT * FROM assessments WHERE org_id = ? ORDER BY created_at DESC', ctx.orgId);
+    const latest = {};
+    for (const a of rows) if (!latest[a.server_id]) latest[a.server_id] = a;
+    const list = servers.map((s) => ({ server: { id: s.id, name: s.name, platform: s.platform || 'linux', status: s.status }, assessment: latest[s.id] ? publicAssessment(latest[s.id]) : null }));
+    const scored = list.filter((x) => x.assessment && typeof x.assessment.score === 'number');
+    const sum = (f) => scored.reduce((a, b) => a + (f(b.assessment) || 0), 0);
+    const summary = {
+      servers: servers.length, assessed: scored.length,
+      avg_score: scored.length ? Math.round(scored.reduce((a, b) => a + b.assessment.score, 0) / scored.length) : null,
+      critical: sum((a) => a.counts.critical), high: sum((a) => a.counts.high), medium: sum((a) => a.counts.medium), low: sum((a) => a.counts.low),
+    };
+    return { assessments: list, summary };
+  });
+  r.get('/api/servers/:id/assessment', requireUser(), async (req, ctx) => {
+    const s = await getServer(ctx.params.id, ctx.orgId);
+    if (!s) throw new HttpError(404, 'Server not found');
+    const a = await one('SELECT * FROM assessments WHERE server_id = ? ORDER BY created_at DESC LIMIT 1', s.id);
+    const history = await all('SELECT id, score, counts, created_at FROM assessments WHERE server_id = ? ORDER BY created_at DESC LIMIT 20', s.id);
+    return { assessment: publicAssessment(a), history: history.map((h) => ({ id: h.id, score: h.score, counts: parseJson(h.counts, {}), created_at: h.created_at })) };
+  });
+
+  const esc = (x) => String(x ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  r.get('/api/report', requireUser(), async (req, ctx) => {
+    const org = await one('SELECT name FROM organizations WHERE id = ?', ctx.orgId);
+    const servers = await all('SELECT id, name, platform FROM servers WHERE org_id = ? ORDER BY name', ctx.orgId);
+    const rows = await all('SELECT * FROM assessments WHERE org_id = ? ORDER BY created_at DESC', ctx.orgId);
+    const latest = {};
+    for (const a of rows) if (!latest[a.server_id]) latest[a.server_id] = publicAssessment(a);
+    const sevLabel = { critical: 'Nghiêm trọng', high: 'Cao', medium: 'Trung bình', low: 'Thấp' };
+    const now2 = new Date().toISOString();
+    const scored = servers.filter((s) => latest[s.id] && typeof latest[s.id].score === 'number');
+    const avg = scored.length ? Math.round(scored.reduce((a, s) => a + latest[s.id].score, 0) / scored.length) : null;
+    let body = `<h1>Báo cáo đánh giá an toàn hạ tầng</h1>
+      <p class="meta">Công ty: <strong>${esc(org?.name)}</strong> · Lập lúc: ${esc(new Date(now2).toLocaleString('vi-VN'))} · Số server: ${servers.length} · Điểm trung bình: ${avg ?? '—'}/100</p>`;
+    for (const s of servers) {
+      const a = latest[s.id];
+      body += `<section><h2>${esc(s.name)} <span class="plat">${esc(s.platform || 'linux')}</span></h2>`;
+      if (!a) { body += '<p class="muted">Chưa đánh giá.</p></section>'; continue; }
+      const inv = a.inventory || {};
+      body += `<p class="score score-${a.score < 60 ? 'bad' : a.score < 80 ? 'warn' : 'ok'}">Điểm an toàn: ${a.score}/100</p>
+        <p class="meta">OS: ${esc(inv.os || '—')} · Kernel: ${esc(inv.kernel || '—')} · Phần mềm: ${esc(inv.packages_count ?? '—')} · Đánh giá: ${esc(new Date(a.created_at).toLocaleString('vi-VN'))}</p>`;
+      if (!a.findings.length) body += '<p class="muted">Không phát hiện vấn đề.</p>';
+      else {
+        body += '<table><thead><tr><th>Mức</th><th>Vấn đề</th><th>Chi tiết</th><th>Khuyến nghị khắc phục</th></tr></thead><tbody>';
+        for (const f of a.findings.sort((x, y) => ({ critical: 0, high: 1, medium: 2, low: 3 }[x.severity] - { critical: 0, high: 1, medium: 2, low: 3 }[y.severity]))) {
+          body += `<tr class="sev-${esc(f.severity)}"><td>${esc(sevLabel[f.severity] || f.severity)}</td><td>${esc(f.title)}</td><td>${esc(f.detail)}</td><td>${esc(f.remediation)}${f.fix ? ` <em>(có thể tự khắc phục)</em>` : ''}</td></tr>`;
+        }
+        body += '</tbody></table>';
+      }
+      body += '</section>';
+    }
+    const html = `<!doctype html><html lang="vi"><head><meta charset="utf-8"><title>Báo cáo an toàn — ${esc(org?.name)}</title>
+      <style>body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:960px;margin:24px auto;padding:0 16px;color:#1a1a1a}
+      h1{font-size:22px}h2{font-size:17px;margin-top:28px;border-bottom:1px solid #ddd;padding-bottom:4px}
+      .plat{font-size:11px;background:#eef;padding:2px 6px;border-radius:4px;color:#335}
+      .meta{color:#666;font-size:13px}.muted{color:#888}
+      .score{font-weight:700}.score-bad{color:#c0262c}.score-warn{color:#b8860b}.score-ok{color:#1a7f37}
+      table{border-collapse:collapse;width:100%;font-size:13px;margin-top:8px}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}
+      th{background:#f6f6f6}tr.sev-critical td:first-child{color:#c0262c;font-weight:700}tr.sev-high td:first-child{color:#d65a00;font-weight:600}
+      </style></head><body>${body}
+      <footer class="meta" style="margin-top:32px;border-top:1px solid #ddd;padding-top:8px">Tạo tự động bởi nền tảng quản lý hạ tầng.</footer></body></html>`;
+    return { html, generated_at: now2, filename: `bao-cao-an-toan-${(org?.name || 'infra').replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase()}-${now2.slice(0, 10)}.html` };
+  });
+
   // ------------------------------------------------------------------ secrets vault
   r.get('/api/secrets', requireUser('operator'), async (req, ctx) => ({
     secrets: await all('SELECT id, name, description, created_by, created_at, updated_at FROM secrets WHERE org_id = ? ORDER BY name', ctx.orgId),
@@ -733,6 +804,16 @@ function createApp(db) {
       } else if (host && t.action === 'net.remote_uninstall' && result.uninstalled) {
         await run("UPDATE scanned_devices SET status = 'discovered', managed_server_id = NULL WHERE org_id = ? AND ip = ?", ctx.server.org_id, host);
       }
+    }
+    if (t.action === 'security.deep_audit' && status === 'succeeded' && result && Array.isArray(result.findings)) {
+      await run('INSERT INTO assessments (id, org_id, server_id, score, counts, findings, inventory, created_at) VALUES (?,?,?,?,?,?,?,?)',
+        sec.newId('asm'), ctx.server.org_id, ctx.server.id, Number.isInteger(result.score) ? result.score : null,
+        JSON.stringify(result.counts || {}), JSON.stringify(result.findings).slice(0, 512 * 1024), result.inventory ? JSON.stringify(result.inventory) : null, now());
+      const crit = (result.counts && result.counts.critical) || 0;
+      const key = `${ctx.server.id}:risk`;
+      if (crit > 0) await upsertAlert(ctx.server.org_id, ctx.server.id, key, 'critical', 'security', `${ctx.server.name}: ${crit} lỗ hổng nghiêm trọng (điểm an toàn ${result.score}/100)`);
+      else if (typeof result.score === 'number' && result.score < 60) await upsertAlert(ctx.server.org_id, ctx.server.id, key, 'warning', 'security', `${ctx.server.name}: điểm an toàn thấp (${result.score}/100)`);
+      else await resolveAlert(key);
     }
     if (t.action === 'security.audit' && result && Array.isArray(result.findings)) {
       const high = result.findings.filter((f) => f.severity === 'high');

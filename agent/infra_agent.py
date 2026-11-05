@@ -61,6 +61,10 @@ ACTIONS = {
     "security.firewall_allow": {"port": ("int", 1, 65535, None), "proto": ("enum", ("tcp", "udp"), "tcp")},
     "security.firewall_deny": {"port": ("int", 1, 65535, None), "proto": ("enum", ("tcp", "udp"), "tcp")},
     "security.block_ip": {"ip": ("str", IP, None)},
+    "security.deep_audit": {},
+    "security.harden_sysctl": {},
+    "security.disable_service": {"name": ("str", NAME, None)},
+    "security.ssh_harden": {"permit_root": ("enum", ("no", "prohibit-password"), "prohibit-password"), "password_auth": ("enum", ("no", "yes"), "no")},
     "db.postgres.status": {},
     "db.postgres.backup": {"database": ("str", DBNAME, None)},
     "db.mysql.status": {"user": ("str", NAME, "root"), "password": ("secret",)},
@@ -626,6 +630,244 @@ def a_shell(p, cfg):
     return sh(["/bin/sh", "-c", p["command"]], timeout=int(cfg.get("shell_timeout", 300))) + (None,)
 
 
+# ----------------------------------------------------------------------------- deep security assessment
+# Distros whose given VERSION_ID is already end-of-life (no more security updates) as of 2026.
+EOL_RELEASES = {
+    "ubuntu": {"14.04", "16.04", "18.04", "19.04", "19.10", "20.10", "21.04", "21.10", "22.10", "23.04", "23.10"},
+    "debian": {"7", "8", "9", "10"},
+    "centos": {"6", "7", "8"},
+    "rhel": {"6", "7"},
+    "fedora": {str(n) for n in range(20, 38)},
+}
+# Packages that are a risk simply by being installed (cleartext / legacy / rarely needed daemons).
+RISKY_PACKAGES = {
+    "telnetd": "Telnet truyền mật khẩu dạng rõ", "telnet-server": "Telnet server truyền mật khẩu dạng rõ",
+    "rsh-server": "rsh/rlogin không mã hoá", "rsh-redone-server": "rsh không mã hoá",
+    "nis": "NIS/yp lộ thông tin tài khoản", "ypserv": "NIS server lỗi thời",
+    "tftpd": "TFTP không xác thực", "tftpd-hpa": "TFTP không xác thực",
+    "xinetd": "Super-server lỗi thời, nên tắt nếu không dùng", "finger": "Dịch vụ finger lộ thông tin người dùng",
+    "vsftpd": "FTP (cân nhắc chuyển sang SFTP)", "proftpd-basic": "FTP (cân nhắc chuyển sang SFTP)",
+}
+# sysctl hardening baseline (key -> desired value).
+SYSCTL_BASELINE = {
+    "kernel.randomize_va_space": "2",
+    "net.ipv4.conf.all.rp_filter": "1",
+    "net.ipv4.tcp_syncookies": "1",
+    "net.ipv4.conf.all.accept_redirects": "0",
+    "net.ipv4.conf.all.send_redirects": "0",
+    "net.ipv4.conf.all.accept_source_route": "0",
+    "net.ipv4.icmp_echo_ignore_broadcasts": "1",
+}
+
+
+def installed_packages():
+    if which("dpkg-query"):
+        code, out = sh(["dpkg-query", "-W", "-f=${Package} ${Version}\n"], timeout=120)
+        if code == 0:
+            return [l.split(" ", 1)[0] for l in out.splitlines() if l.strip()]
+    if which("rpm"):
+        code, out = sh(["rpm", "-qa", "--qf", "%{NAME}\n"], timeout=120)
+        if code == 0:
+            return [l.strip() for l in out.splitlines() if l.strip()]
+    return []
+
+
+def sysctl_value(key):
+    path = "/proc/sys/" + key.replace(".", "/")
+    v = read(path).strip()
+    return v or None
+
+
+def bios_info():
+    info = {}
+    if which("dmidecode"):
+        for field, key in (("bios-version", "version"), ("bios-release-date", "date"), ("system-manufacturer", "vendor"), ("system-product-name", "product")):
+            code, out = sh(["dmidecode", "-s", field], timeout=20)
+            if code == 0 and out.strip() and "Permission" not in out:
+                info[key] = out.strip().splitlines()[0]
+    return info
+
+
+def a_deep_audit(p, cfg):
+    findings = []
+
+    def add(sev, fid, title, detail, remediation, fix=None, refs=None):
+        findings.append({"id": fid, "severity": sev, "category": "security", "title": title, "detail": detail,
+                         "remediation": remediation, "fix": fix, "refs": refs or []})
+
+    osr = os_release()
+    distro, ver = (osr.get("ID") or "").lower(), (osr.get("VERSION_ID") or "")
+    pkgs = installed_packages()
+    pkgset = set(pkgs)
+    bios = bios_info()
+
+    # 1. OS end-of-life
+    if distro in EOL_RELEASES and ver in EOL_RELEASES[distro]:
+        add("critical", "os_eol", "Hệ điều hành đã hết hỗ trợ (EOL)",
+            "%s %s không còn nhận bản vá bảo mật." % (osr.get("PRETTY_NAME") or distro, ver),
+            "Nâng cấp lên phiên bản còn được hỗ trợ (vd: Ubuntu LTS mới, Debian stable hiện hành). Lập kế hoạch nâng cấp sớm vì lỗ hổng mới sẽ không được vá.")
+
+    # 2. Pending security updates
+    n = count_security_updates()
+    if n:
+        add("high", "security_updates", "%d bản vá bảo mật chưa cài" % n,
+            "Có %d cập nhật bảo mật đang chờ." % n,
+            "Cài bản vá bảo mật. Có thể bấm 'Khắc phục' để agent tự cài (chỉ bản vá bảo mật).",
+            fix={"action": "system.update_apply", "params": {"security_only": True}, "label": "Cài bản vá bảo mật ngay"})
+
+    # 3. Risky installed packages
+    for pkg, why in RISKY_PACKAGES.items():
+        if pkg in pkgset:
+            auto = pkg in ("telnetd", "telnet-server", "rsh-server", "rsh-redone-server", "tftpd", "tftpd-hpa", "finger", "xinetd")
+            add("high" if auto else "medium", "pkg_" + pkg, "Gói rủi ro đã cài: %s" % pkg, why,
+                "Gỡ hoặc tắt dịch vụ nếu không thực sự cần. Thay bằng phương án mã hoá (SSH/SFTP/HTTPS).",
+                fix=({"action": "security.disable_service", "params": {"name": pkg}, "label": "Tắt dịch vụ %s" % pkg} if auto else None))
+
+    # 4. SSH hardening (from sshd -T)
+    ssh = {}
+    code, out = sh(["sshd", "-T"], timeout=20)
+    if code == 0:
+        for line in out.splitlines():
+            k, _, v = line.partition(" ")
+            ssh[k.lower()] = v.strip().lower()
+    if ssh:
+        if ssh.get("permitrootlogin") == "yes":
+            add("high", "ssh_root", "SSH cho phép đăng nhập root trực tiếp",
+                "PermitRootLogin đang là 'yes'.",
+                "Đặt PermitRootLogin prohibit-password (chỉ cho phép bằng SSH key) hoặc no.",
+                fix={"action": "security.ssh_harden", "params": {"permit_root": "prohibit-password", "password_auth": ssh.get("passwordauthentication", "yes")}, "label": "Chỉ cho root đăng nhập bằng key"},
+                refs=["CIS SSH"])
+        if ssh.get("passwordauthentication", "yes") == "yes":
+            add("medium", "ssh_passwd", "SSH cho phép đăng nhập bằng mật khẩu",
+                "PasswordAuthentication đang là 'yes' — dễ bị dò mật khẩu.",
+                "Dùng SSH key và đặt PasswordAuthentication no. CHỈ làm sau khi chắc chắn đã có key hoạt động, nếu không sẽ mất quyền truy cập.",
+                fix={"action": "security.ssh_harden", "params": {"permit_root": ssh.get("permitrootlogin", "prohibit-password") if ssh.get("permitrootlogin") in ("no", "prohibit-password") else "prohibit-password", "password_auth": "no"}, "label": "Tắt đăng nhập mật khẩu (cần có SSH key)"})
+        if ssh.get("permitemptypasswords") == "yes":
+            add("critical", "ssh_empty", "SSH cho phép mật khẩu rỗng", "PermitEmptyPasswords=yes.",
+                "Đặt PermitEmptyPasswords no ngay.")
+
+    # 5. Accounts
+    uid0 = [l.split(":")[0] for l in read("/etc/passwd").splitlines() if l.count(":") >= 6 and l.split(":")[2] == "0" and l.split(":")[0] != "root"]
+    if uid0:
+        add("critical", "uid0", "Tài khoản khác root mang UID 0", ", ".join(uid0),
+            "Chỉ 'root' được mang UID 0. Đổi UID hoặc xoá các tài khoản này.")
+    empty_pw = [l.split(":")[0] for l in read("/etc/shadow").splitlines() if l.count(":") >= 1 and l.split(":")[1] == ""]
+    if empty_pw:
+        add("critical", "empty_pw", "Tài khoản có mật khẩu rỗng", ", ".join(empty_pw),
+            "Đặt mật khẩu mạnh hoặc khoá tài khoản: passwd -l <user>.")
+    nopasswd = []
+    for sf in ["/etc/sudoers"] + ["/etc/sudoers.d/" + f for f in (os.listdir("/etc/sudoers.d") if os.path.isdir("/etc/sudoers.d") else [])]:
+        for line in read(sf).splitlines():
+            if "NOPASSWD" in line and not line.strip().startswith("#"):
+                nopasswd.append(line.strip())
+    if nopasswd:
+        add("medium", "sudo_nopasswd", "Có quy tắc sudo NOPASSWD", "%d dòng cho phép sudo không cần mật khẩu." % len(nopasswd),
+            "Xem lại và bỏ NOPASSWD trừ khi thật sự cần cho tự động hoá có kiểm soát.")
+
+    # 6. Firewall + exposed services
+    fw = firewall_kind()
+    active = False
+    if fw == "ufw":
+        _, o = sh(["ufw", "status"], timeout=20); active = "Status: active" in o
+    elif fw == "firewalld":
+        c, _ = sh(["firewall-cmd", "--state"], timeout=20); active = c == 0
+    elif which("nft"):
+        _, o = sh(["nft", "list", "ruleset"], timeout=20); active = "chain" in o
+    if not active:
+        add("medium", "firewall_off", "Firewall chưa bật", "Không phát hiện firewall đang hoạt động.",
+            "Bật ufw/firewalld và chỉ mở cổng cần thiết. (Tự bật tiềm ẩn rủi ro mất kết nối nên cần làm thủ công, đảm bảo cổng SSH được cho phép trước.)")
+    risky_ports = {"3306": "MySQL", "5432": "PostgreSQL", "6379": "Redis", "27017": "MongoDB", "9200": "Elasticsearch", "11211": "Memcached", "5900": "VNC", "23": "Telnet"}
+    for port in listening_ports():
+        host, _, pnum = port["local"].rpartition(":")
+        if pnum in risky_ports and host in ("0.0.0.0", "*", "[::]", "::"):
+            add("high", "exposed_" + pnum, "%s lắng nghe trên mọi địa chỉ (cổng %s)" % (risky_ports[pnum], pnum),
+                "Dịch vụ %s đang mở ra ngoài." % risky_ports[pnum],
+                "Chỉ bind 127.0.0.1 hoặc giới hạn bằng firewall. Có thể bấm 'Khắc phục' để đóng cổng này bằng firewall.",
+                fix={"action": "security.firewall_deny", "params": {"port": int(pnum), "proto": "tcp"}, "label": "Đóng cổng %s bằng firewall" % pnum})
+
+    # 7. Kernel / sysctl hardening
+    bad_sysctl = {k: sysctl_value(k) for k in SYSCTL_BASELINE if sysctl_value(k) is not None and sysctl_value(k) != SYSCTL_BASELINE[k]}
+    if bad_sysctl:
+        add("medium", "sysctl", "Tham số nhân (sysctl) chưa được tăng cường",
+            "; ".join("%s=%s (nên %s)" % (k, v, SYSCTL_BASELINE[k]) for k, v in bad_sysctl.items()),
+            "Áp dụng cấu hình sysctl an toàn (ASLR, rp_filter, chống redirect/source-route, syncookies). Bấm 'Khắc phục' để agent áp dụng.",
+            fix={"action": "security.harden_sysctl", "params": {}, "label": "Áp dụng sysctl tăng cường"})
+
+    # 8. Hardening tools
+    if not which("fail2ban-client"):
+        add("low", "no_fail2ban", "Chưa cài fail2ban", "Không có cơ chế tự chặn dò mật khẩu.",
+            "Cài fail2ban để tự chặn IP dò mật khẩu SSH.")
+    if pkg_manager() == "apt-get" and not os.path.exists("/etc/apt/apt.conf.d/20auto-upgrades"):
+        add("low", "no_auto_updates", "Chưa bật tự động cập nhật bảo mật", "unattended-upgrades chưa cấu hình.",
+            "Bật unattended-upgrades để tự cài bản vá bảo mật.")
+    if os.path.exists("/var/run/reboot-required"):
+        add("low", "reboot_required", "Cần khởi động lại", "Có cập nhật nhân/thư viện cần reboot.",
+            "Lên lịch khởi động lại để áp dụng cập nhật.")
+
+    weights = {"critical": 40, "high": 25, "medium": 10, "low": 3}
+    score = max(0, 100 - sum(weights[f["severity"]] for f in findings))
+    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in weights}
+    inventory = {
+        "os": osr.get("PRETTY_NAME") or distro, "os_id": distro, "version_id": ver,
+        "kernel": platform.release(), "arch": platform.machine(),
+        "packages_count": len(pkgs), "bios": bios, "firewall": fw or "none",
+    }
+    lines = ["Điểm an toàn: %d/100 (nghiêm trọng %d, cao %d, trung bình %d, thấp %d)" % (score, counts["critical"], counts["high"], counts["medium"], counts["low"])]
+    for f in findings:
+        lines.append("[%s] %s" % (f["severity"].upper(), f["title"]))
+    return 0, "\n".join(lines), {"score": score, "counts": counts, "findings": findings, "inventory": inventory}
+
+
+def a_harden_sysctl(p, cfg):
+    conf = "/etc/sysctl.d/99-infra-hardening.conf"
+    body = "# Managed by infra-agent\n" + "".join("%s = %s\n" % (k, v) for k, v in SYSCTL_BASELINE.items())
+    try:
+        with open(conf, "w") as f:
+            f.write(body)
+    except OSError as e:
+        return 1, "Không ghi được %s: %s" % (conf, e), None
+    code, out = sh(["sysctl", "--system"], timeout=60)
+    return code, "Đã ghi %s và áp dụng.\n%s" % (conf, out), {"applied": list(SYSCTL_BASELINE)}
+
+
+def a_disable_service(p, cfg):
+    name = p["name"]
+    outputs = []
+    # stop + disable the systemd unit if present
+    if which("systemctl"):
+        for verb in ("stop", "disable"):
+            c, o = sh(["systemctl", verb, name], timeout=60)
+            outputs.append("systemctl %s: %s" % (verb, o.strip() or ("ok" if c == 0 else "rc=%d" % c)))
+    # also mask to prevent socket-activation restart
+    if which("systemctl"):
+        c, o = sh(["systemctl", "mask", name], timeout=30)
+        outputs.append("systemctl mask: %s" % (o.strip() or ("ok" if c == 0 else "rc=%d" % c)))
+    return 0, "\n".join(outputs) or "Đã xử lý %s" % name, {"service": name, "disabled": True}
+
+
+def a_ssh_harden(p, cfg):
+    conf = "/etc/ssh/sshd_config.d/99-infra-hardening.conf"
+    os.makedirs(os.path.dirname(conf), exist_ok=True)
+    lines = ["# Managed by infra-agent", "PermitRootLogin %s" % p["permit_root"], "PasswordAuthentication %s" % p["password_auth"], "PermitEmptyPasswords no"]
+    try:
+        with open(conf, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        return 1, "Không ghi được %s: %s" % (conf, e), None
+    # validate config before reloading, to avoid locking ourselves out
+    code, out = sh(["sshd", "-t"], timeout=20)
+    if code != 0:
+        try:
+            os.remove(conf)
+        except OSError:
+            pass
+        return 1, "Cấu hình SSH không hợp lệ, đã hoàn tác:\n%s" % out, None
+    rc, ro = sh(["systemctl", "reload", "sshd"], timeout=30)
+    if rc != 0:
+        rc, ro = sh(["systemctl", "reload", "ssh"], timeout=30)
+    return 0, "Đã áp dụng cấu hình SSH an toàn (PermitRootLogin=%s, PasswordAuthentication=%s) và reload.\n%s" % (p["permit_root"], p["password_auth"], ro), {"permit_root": p["permit_root"], "password_auth": p["password_auth"]}
+
+
 # ----------------------------------------------------------------------------- network scan
 # Small built-in OUI (MAC vendor prefix) table — best-effort labelling only.
 OUI = {
@@ -1067,6 +1309,10 @@ HANDLERS = {
     "security.firewall_allow": lambda p, c: a_firewall(p, c, "allow"),
     "security.firewall_deny": lambda p, c: a_firewall(p, c, "deny"),
     "security.block_ip": a_block_ip,
+    "security.deep_audit": a_deep_audit,
+    "security.harden_sysctl": a_harden_sysctl,
+    "security.disable_service": a_disable_service,
+    "security.ssh_harden": a_ssh_harden,
     "db.postgres.status": a_pg_status,
     "db.postgres.backup": a_pg_backup,
     "db.mysql.status": a_mysql_status,

@@ -147,3 +147,19 @@ svg.topo { width: 100%; height: auto; max-height: 260px; display: block; margin:
 .topo-node.s-managed .topo-dot { fill: var(--ok); }
 .topo-node.s-connecting .topo-dot { fill: var(--warn); }
 .topo-label { fill: var(--muted); font-size: 10px; }
+
+/* security assessment */
+.score-pill { display:inline-block; min-width:34px; text-align:center; padding:2px 8px; border-radius:10px; font-weight:700; background:var(--ok); color:#fff; }
+.score-pill.warn { background:var(--warn); } .score-pill.crit { background:var(--crit); }
+.big-score { font-size:40px; font-weight:800; line-height:1; color:var(--ok); }
+.big-score.warn { color:var(--warn); } .big-score.crit { color:var(--crit); }
+.big-score span { font-size:16px; color:var(--muted); font-weight:600; }
+.num.ok { color:var(--ok); } .num.warn { color:var(--warn); } .num.crit { color:var(--crit); }
+.findings-list { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+.finding { border:1px solid var(--border); border-left:3px solid var(--muted); border-radius:8px; padding:10px 12px; }
+.finding.sev-critical { border-left-color:var(--crit); } .finding.sev-high { border-left-color:#d65a00; }
+.finding.sev-medium { border-left-color:var(--warn); } .finding.sev-low { border-left-color:var(--muted); }
+.finding-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.finding-head strong { flex:1; }
+.remedy { margin-top:6px; font-size:13px; color:var(--text); }
+td.small, .small { font-size:12px; }

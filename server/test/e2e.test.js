@@ -301,6 +301,56 @@ test('network scan: ingest devices, topology, remote install + uninstall, transi
   assert.match(enrW.body.install_command_windows, /Install-InfraAgent -Server .* -Token '?enr_/);
 });
 
+test('deep security assessment: run, store, remediate, report', async () => {
+  const owner = (await api('POST', '/api/auth/login', { email: 'owner@example.com', password: 'correct horse battery' })).body.token;
+  const enr = await api('POST', '/api/enrollment-tokens', { name: 'audit-host' }, owner);
+  const en = await api('POST', '/api/agent/enroll', { token: enr.body.token, platform: 'linux', facts: { hostname: 'audit', primary_ip: '10.9.0.9' }, metrics: { cpu_percent: 1 } });
+  const srvId = en.body.server_id; const agentToken = en.body.agent_token;
+  const runNext = async (resultBody, expectAction) => {
+    const hb = await api('POST', '/api/agent/heartbeat', {}, agentToken);
+    const task = expectAction ? hb.body.tasks.find((t) => t.action === expectAction) : hb.body.tasks[0];
+    assert.ok(task, `expected a ${expectAction || 'queued'} task`);
+    await api('POST', `/api/agent/tasks/${task.id}/result`, resultBody, agentToken);
+    return task;
+  };
+
+  assert.equal((await api('POST', `/api/servers/${srvId}/tasks`, { action: 'security.deep_audit', params: {} }, owner)).body.task.action, 'security.deep_audit');
+  await runNext({
+    status: 'succeeded', exit_code: 0,
+    result: {
+      score: 35, counts: { critical: 1, high: 1, medium: 0, low: 0 },
+      inventory: { os: 'Ubuntu 18.04', kernel: '4.15.0', packages_count: 500, firewall: 'none' },
+      findings: [
+        { id: 'os_eol', severity: 'critical', category: 'security', title: 'OS EOL', detail: 'Ubuntu 18.04 hết hỗ trợ', remediation: 'Nâng cấp', fix: null, refs: [] },
+        { id: 'security_updates', severity: 'high', category: 'security', title: '5 bản vá', detail: '5 pending', remediation: 'Cài vá', fix: { action: 'system.update_apply', params: { security_only: true }, label: 'Cài vá' }, refs: [] },
+      ],
+    },
+  }, 'security.deep_audit');
+
+  const asm = (await api('GET', `/api/servers/${srvId}/assessment`, null, owner)).body.assessment;
+  assert.equal(asm.score, 35);
+  assert.equal(asm.findings.length, 2);
+  const list = (await api('GET', '/api/assessments', null, owner)).body;
+  assert.ok(list.summary.critical >= 1);
+  assert.ok(list.assessments.some((x) => x.server.id === srvId && x.assessment));
+  const alerts = (await api('GET', '/api/alerts', null, owner)).body.alerts;
+  assert.ok(alerts.some((a) => a.type === 'security' && a.severity === 'critical'));
+
+  const fix = (await api('POST', `/api/servers/${srvId}/tasks`, { action: 'system.update_apply', params: { security_only: true }, confirm: true }, owner));
+  assert.equal(fix.status, 200);
+
+  const report = (await api('GET', '/api/report', null, owner)).body;
+  assert.match(report.html, /Báo cáo đánh giá an toàn/);
+  assert.match(report.html, /audit-host/);
+  assert.match(report.html, /35\/100/);
+  assert.ok(report.filename.endsWith('.html'));
+
+  await api('POST', `/api/servers/${srvId}/tasks`, { action: 'security.deep_audit', params: {} }, owner);
+  await runNext({ status: 'succeeded', exit_code: 0, result: { score: 95, counts: { critical: 0, high: 0, medium: 0, low: 1 }, inventory: { os: 'Ubuntu 24.04' }, findings: [{ id: 'x', severity: 'low', title: 'minor', detail: '', remediation: 'ok', fix: null, refs: [] }] } }, 'security.deep_audit');
+  const alerts2 = (await api('GET', '/api/alerts', null, owner)).body.alerts;
+  assert.equal(alerts2.some((a) => a.dedupe_key === `${srvId}:risk`), false, 'risk alert resolved after clean re-audit');
+});
+
 test('static: web UI and agent files are served, traversal blocked', async () => {
   const index = await fetch(base + '/');
   assert.equal(index.status, 200);

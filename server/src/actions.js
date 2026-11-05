@@ -35,6 +35,13 @@ const ACTIONS = {
   'security.firewall_allow':  { category: 'security', title: 'Mở cổng firewall', minRole: 'admin', destructive: true, params: { port: { type: 'int', min: 1, max: 65535, required: true }, proto: { type: 'enum', values: ['tcp', 'udp'], default: 'tcp' } } },
   'security.firewall_deny':   { category: 'security', title: 'Đóng cổng firewall', minRole: 'admin', destructive: true, params: { port: { type: 'int', min: 1, max: 65535, required: true }, proto: { type: 'enum', values: ['tcp', 'udp'], default: 'tcp' } } },
   'security.block_ip':        { category: 'security', title: 'Chặn địa chỉ IP', minRole: 'admin', destructive: true, params: { ip: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true } } },
+  'security.deep_audit':      { category: 'security', title: 'Đánh giá bảo mật chuyên sâu', minRole: 'operator', params: {} },
+  // ---- remediation (auto-fix) ----
+  'security.harden_sysctl':   { category: 'security', title: 'Tăng cường tham số nhân (sysctl)', minRole: 'admin', destructive: true, platforms: ['linux'], params: {} },
+  'security.disable_service': { category: 'security', title: 'Tắt & chặn một dịch vụ rủi ro', minRole: 'admin', destructive: true, platforms: ['linux'], params: { name: { type: 'string', pattern: NAME, required: true } } },
+  'security.ssh_harden':      { category: 'security', title: 'Tăng cường cấu hình SSH', minRole: 'admin', destructive: true, platforms: ['linux'], params: { permit_root: { type: 'enum', values: ['no', 'prohibit-password'], default: 'prohibit-password' }, password_auth: { type: 'enum', values: ['no', 'yes'], default: 'no' } } },
+  'security.disable_smb1':    { category: 'security', title: 'Tắt SMBv1 (Windows)', minRole: 'admin', destructive: true, platforms: ['windows'], params: {} },
+  'security.disable_guest':   { category: 'security', title: 'Tắt tài khoản Guest (Windows)', minRole: 'admin', destructive: true, platforms: ['windows'], params: {} },
 
   // ---- databases ----
   'db.postgres.status':   { category: 'database', title: 'PostgreSQL: trạng thái & danh sách DB', minRole: 'viewer', params: {} },

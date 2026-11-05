@@ -153,6 +153,9 @@ $script:ACTIONS = [ordered]@{
   'security.firewall_allow'   = @{ port = @{ type = 'int'; min = 1; max = 65535; required = $true }; proto = @{ type = 'enum'; values = @('tcp', 'udp'); default = 'tcp' } }
   'security.firewall_deny'    = @{ port = @{ type = 'int'; min = 1; max = 65535; required = $true }; proto = @{ type = 'enum'; values = @('tcp', 'udp'); default = 'tcp' } }
   'security.block_ip'         = @{ ip = @{ type = 'string'; pattern = '^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]{2,39}$'; required = $true } }
+  'security.deep_audit'       = @{}
+  'security.disable_smb1'     = @{}
+  'security.disable_guest'    = @{}
   'shell.exec'                = @{ command = @{ type = 'shell' } }
 }
 
@@ -347,6 +350,83 @@ function Act-SecurityAudit {
   foreach ($f in $findings) { $lines += ("[{0}] {1}{2}" -f $f.severity.ToUpper(), $f.title, $(if ($f.detail) { " - $($f.detail)" } else { '' })) }
   New-Result 0 ($lines -join "`n") @{ score = $score; findings = @($findings) }
 }
+function Get-InstalledSoftwareCount {
+  $n = 0
+  foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    try { $n += (Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName }).Count } catch {}
+  }
+  return $n
+}
+
+function Act-DeepAudit {
+  $findings = New-Object System.Collections.ArrayList
+  $add = { param($sev, $fid, $title, $detail, $remediation, $fix = $null)
+    [void]$findings.Add(@{ id = $fid; severity = $sev; category = 'security'; title = $title; detail = $detail; remediation = $remediation; fix = $fix; refs = @() }) }
+
+  $os = $null; try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch {}
+  $caption = if ($os) { $os.Caption } else { 'Windows' }
+  # 1. EOL Windows versions
+  if ($caption -match 'Windows 7|Windows 8 |Windows Server 2008|Windows Server 2012(?!\sR2)|Windows XP|Vista') {
+    & $add 'critical' 'os_eol' 'Phiên bản Windows đã hết hỗ trợ (EOL)' "$caption không còn nhận bản vá bảo mật." 'Nâng cấp lên phiên bản Windows còn được hỗ trợ.' $null
+  }
+  # 2. pending updates
+  try {
+    $cnt = (Act-UpdateCheck).result.count
+    if ($cnt -gt 0) { & $add 'high' 'updates' "$cnt bản cập nhật chưa cài" "Có $cnt cập nhật đang chờ." 'Cài cập nhật. Bấm Khắc phục để agent tự cài.' @{ action = 'system.update_apply'; params = @{ security_only = $true }; label = 'Cài cập nhật bảo mật ngay' } }
+  } catch {}
+  # 3. SMBv1
+  try { if ((Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol) { & $add 'high' 'smb1' 'SMBv1 đang bật' 'SMBv1 là giao thức lỗi thời, nhiều lỗ hổng (WannaCry/EternalBlue).' 'Tắt SMBv1. Bấm Khắc phục để agent tắt ngay.' @{ action = 'security.disable_smb1'; params = @{}; label = 'Tắt SMBv1' } } } catch {}
+  # 4. Guest account
+  try { $g = Get-LocalUser -Name 'Guest' -ErrorAction Stop; if ($g.Enabled) { & $add 'high' 'guest_on' 'Tài khoản Guest đang bật' 'Guest cho phép truy cập ẩn danh.' 'Tắt tài khoản Guest. Bấm Khắc phục để agent tắt.' @{ action = 'security.disable_guest'; params = @{}; label = 'Tắt Guest' } } } catch {}
+  # 5. Defender
+  try { $av = Get-MpComputerStatus -ErrorAction Stop; if (-not $av.RealTimeProtectionEnabled) { & $add 'high' 'defender_off' 'Windows Defender real-time đang tắt' 'Bảo vệ thời gian thực bị tắt.' 'Bật lại Defender real-time: Set-MpPreference -DisableRealtimeMonitoring $false' $null } } catch {}
+  # 6. RDP + NLA
+  try {
+    $rdp = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections
+    if ($rdp -eq 0) {
+      $nla = 1; try { $nla = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -ErrorAction Stop).UserAuthentication } catch {}
+      $sev = if ($nla -eq 0) { 'high' } else { 'medium' }
+      & $add $sev 'rdp_on' ('RDP đang bật' + $(if ($nla -eq 0) { ' và tắt NLA' } else { '' })) 'Cổng 3389 mở ra ngoài là mục tiêu dò mật khẩu phổ biến.' 'Giới hạn RDP bằng firewall/VPN; bật Network Level Authentication (NLA).' $null
+    }
+  } catch {}
+  # 7. firewall off
+  try { if ((Get-NetFirewallProfile | Where-Object { -not $_.Enabled })) { & $add 'medium' 'firewall_off' 'Có profile firewall đang tắt' 'Một hoặc nhiều profile Windows Firewall đang tắt.' 'Bật Windows Firewall cho mọi profile: Set-NetFirewallProfile -All -Enabled True' $null } } catch {}
+  # 8. exposed risky ports
+  $risky = @{ '3389' = 'RDP'; '445' = 'SMB'; '1433' = 'MSSQL'; '3306' = 'MySQL'; '5985' = 'WinRM-HTTP' }
+  foreach ($c in (Get-ListeningPorts)) {
+    $pnum = ($c.local -split ':')[-1]
+    if ($risky.ContainsKey($pnum) -and ($c.local -match '^0\.0\.0\.0|^\[::\]|^::')) {
+      & $add 'medium' "exposed_$pnum" "$($risky[$pnum]) lắng nghe trên mọi địa chỉ (cổng $pnum)" "Dịch vụ $($risky[$pnum]) mở ra ngoài." 'Giới hạn bằng Windows Firewall hoặc chỉ bind nội bộ.' $null
+    }
+  }
+  # 9. pending reboot
+  if (Get-PendingReboot) { & $add 'low' 'reboot_required' 'Cần khởi động lại' 'Có cập nhật chờ reboot.' 'Lên lịch khởi động lại.' $null }
+
+  $weights = @{ critical = 40; high = 25; medium = 10; low = 3 }
+  $penalty = ($findings | ForEach-Object { $weights[$_.severity] } | Measure-Object -Sum).Sum
+  $score = [math]::Max(0, 100 - [int]$penalty)
+  $counts = @{ critical = 0; high = 0; medium = 0; low = 0 }
+  foreach ($f in $findings) { $counts[$f.severity]++ }
+  $bios = $null; try { $b = Get-CimInstance Win32_BIOS -ErrorAction Stop; $bios = @{ version = $b.SMBIOSBIOSVersion; vendor = $b.Manufacturer; date = [string]$b.ReleaseDate } } catch {}
+  $inventory = @{ os = $caption; os_id = 'windows'; version_id = if ($os) { $os.Version } else { '' }; kernel = if ($os) { $os.Version } else { '' }
+    arch = $env:PROCESSOR_ARCHITECTURE; packages_count = (Get-InstalledSoftwareCount); bios = $bios; firewall = 'windows-firewall' }
+  $lines = @("Điểm an toàn: $score/100 (nghiêm trọng $($counts.critical), cao $($counts.high), trung bình $($counts.medium), thấp $($counts.low))")
+  foreach ($f in $findings) { $lines += "[$($f.severity.ToUpper())] $($f.title)" }
+  New-Result 0 ($lines -join "`n") @{ score = $score; counts = $counts; findings = @($findings); inventory = $inventory }
+}
+
+function Act-DisableSmb1 {
+  try {
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+    try { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null } catch {}
+    New-Result 0 'Đã tắt SMBv1.' @{ disabled = $true }
+  } catch { New-Result 1 $_.Exception.Message }
+}
+function Act-DisableGuest {
+  try { Disable-LocalUser -Name 'Guest' -ErrorAction Stop; New-Result 0 'Đã tắt tài khoản Guest.' @{ disabled = $true } }
+  catch { New-Result 1 $_.Exception.Message }
+}
+
 function Act-Shell { param($p, $cfg)
   try {
     $global:LASTEXITCODE = 0
@@ -376,6 +456,9 @@ $script:HANDLERS = @{
   'security.firewall_allow'  = { param($p, $c) Act-FirewallRule $p 'allow' }
   'security.firewall_deny'   = { param($p, $c) Act-FirewallRule $p 'deny' }
   'security.block_ip'        = { param($p, $c) Act-BlockIp $p }
+  'security.deep_audit'      = { param($p, $c) Act-DeepAudit }
+  'security.disable_smb1'    = { param($p, $c) Act-DisableSmb1 }
+  'security.disable_guest'   = { param($p, $c) Act-DisableGuest }
   'shell.exec'               = { param($p, $c) Act-Shell $p $c }
 }
 

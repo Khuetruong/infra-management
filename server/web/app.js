@@ -190,6 +190,7 @@ const NAV = [
   { path: '/', label: 'Tổng quan' },
   { path: '/servers', label: 'Server' },
   { path: '/network', label: 'Hạ tầng mạng' },
+  { path: '/security', label: 'Bảo mật' },
   { path: '/alerts', label: 'Cảnh báo', badge: true },
   { path: '/tasks', label: 'Lịch sử lệnh' },
   { path: '/secrets', label: 'Kho bí mật', role: 'operator' },
@@ -236,6 +237,7 @@ const ROUTES = [
   [/^\/servers$/, viewServers],
   [/^\/servers\/([^/]+)$/, viewServer],
   [/^\/network$/, viewNetwork],
+  [/^\/security$/, viewSecurity],
   [/^\/alerts$/, viewAlerts],
   [/^\/tasks$/, viewTasks],
   [/^\/secrets$/, viewSecrets],
@@ -746,6 +748,106 @@ function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'insta
   h('div', { class: 'actions' }, submitBtn));
   const close = modal('Quản lý agent trên thiết bị', form);
   syncOp();
+}
+
+// ------------------------------------------------------------------ security assessment
+const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+const SEV_LABEL = { critical: 'Nghiêm trọng', high: 'Cao', medium: 'Trung bình', low: 'Thấp' };
+const scoreClass = (s) => (s == null ? '' : s < 60 ? 'crit' : s < 80 ? 'warn' : 'ok');
+
+async function runDeepAudit(serverId, onDone) {
+  const { task } = await api('POST', `/api/servers/${serverId}/tasks`, { action: 'security.deep_audit', params: {} });
+  toast('Đang đánh giá bảo mật chuyên sâu…');
+  showTask(task.id);
+  // poll until the assessment is stored, then refresh
+  const t = setInterval(async () => {
+    const r = await api('GET', `/api/tasks/${task.id}`).catch(() => null);
+    if (r && !['queued', 'dispatched'].includes(r.task.status)) { clearInterval(t); onDone(); }
+  }, 2500);
+}
+
+async function downloadReport() {
+  const r = await api('GET', '/api/report');
+  const blob = new Blob([r.html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: r.filename || 'bao-cao-an-toan.html' });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast('Đã tải báo cáo');
+}
+
+function findingItem(serverId, f, onFixed) {
+  const fixBtn = f.fix && can('admin') && h('button', { class: 'small primary', onclick: guard(async () => {
+    if (!(await confirmDialog('Tự khắc phục', `"${f.fix.label || f.fix.action}" sẽ thay đổi cấu hình trên server và ghi vào nhật ký audit. Tiếp tục?`, { confirmText: 'Khắc phục' }))) return;
+    const { task } = await api('POST', `/api/servers/${serverId}/tasks`, { action: f.fix.action, params: f.fix.params || {}, confirm: true });
+    toast('Đang khắc phục…');
+    showTask(task.id);
+    if (onFixed) onFixed();
+  }) }, `🔧 ${f.fix.label || 'Khắc phục'}`);
+  return h('div', { class: `finding sev-${f.severity}` },
+    h('div', { class: 'finding-head' }, badge(f.severity), h('strong', {}, f.title), fixBtn),
+    f.detail && h('div', { class: 'muted' }, f.detail),
+    f.remediation && h('div', { class: 'remedy' }, '➜ ', f.remediation),
+    f.refs && f.refs.length ? h('div', { class: 'muted mono small' }, f.refs.join(' · ')) : null);
+}
+
+async function showAssessment(serverId, serverName, onChanged) {
+  const body = h('div', {}, 'Đang tải…');
+  modal(`Bảo mật: ${serverName}`, body, { wide: true });
+  const render = async () => {
+    const { assessment } = await api('GET', `/api/servers/${serverId}/assessment`);
+    if (!assessment) { fill(body, h('div', { class: 'empty' }, 'Chưa có đánh giá. Bấm "Đánh giá chuyên sâu" để bắt đầu.'),
+      h('div', { class: 'actions' }, can('operator') && h('button', { class: 'primary', onclick: guard(() => runDeepAudit(serverId, () => { render(); onChanged && onChanged(); })) }, 'Đánh giá chuyên sâu'))); return; }
+    const inv = assessment.inventory || {};
+    const findings = (assessment.findings || []).slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
+    fill(body,
+      h('div', { class: 'row', style: null },
+        h('div', { class: `big-score ${scoreClass(assessment.score)}` }, `${assessment.score}`, h('span', {}, '/100')),
+        h('div', {}, h('div', { class: 'muted' }, `Đánh giá lúc ${fmtTime(assessment.created_at)}`),
+          h('div', { class: 'muted' }, `${esc2(inv.os) || ''}${inv.kernel ? ' · ' + inv.kernel : ''}${inv.packages_count != null ? ' · ' + inv.packages_count + ' gói' : ''}`))),
+      h('div', { class: 'row', style: null },
+        can('operator') && h('button', { onclick: guard(() => runDeepAudit(serverId, () => { render(); onChanged && onChanged(); })) }, 'Đánh giá lại'),
+        can('operator') && h('button', { onclick: guard(downloadReport) }, 'Tải báo cáo')),
+      findings.length ? h('div', { class: 'findings-list' }, findings.map((f) => findingItem(serverId, f, () => setTimeout(() => { render(); onChanged && onChanged(); }, 1500)))) : h('p', {}, 'Không phát hiện vấn đề.'));
+    body.querySelectorAll('.row').forEach((r) => { r.style.gap = '12px'; r.style.alignItems = 'center'; r.style.marginBottom = '10px'; });
+  };
+  await render().catch((e) => fill(body, h('div', { class: 'err' }, e.message)));
+}
+const esc2 = (x) => (x == null ? '' : String(x));
+
+async function viewSecurity(el) {
+  const box = h('div', {});
+  const draw = async () => {
+    const { assessments, summary } = await api('GET', '/api/assessments');
+    const stat = (num, lbl, cls) => h('div', { class: 'panel stat' }, h('div', { class: `num ${cls || ''}` }, num), h('div', { class: 'lbl' }, lbl));
+    fill(box,
+      h('div', { class: 'grid cards' },
+        stat(summary.avg_score == null ? '—' : `${summary.avg_score}`, 'Điểm an toàn TB', scoreClass(summary.avg_score)),
+        stat(summary.critical, 'Lỗ hổng nghiêm trọng', summary.critical ? 'crit' : ''),
+        stat(summary.high, 'Mức cao', summary.high ? 'warn' : ''),
+        stat(`${summary.assessed}/${summary.servers}`, 'Server đã đánh giá')),
+      h('div', { class: 'panel table-wrap', style: null },
+        assessments.length ? h('table', {},
+          h('thead', {}, h('tr', {}, ['Server', 'Nền', 'Điểm', 'Nghiêm trọng', 'Cao', 'TB', 'Thấp', 'Đánh giá lúc', ''].map((x) => h('th', {}, x)))),
+          h('tbody', {}, assessments.map(({ server, assessment }) => {
+            const c = assessment?.counts || {};
+            return h('tr', {},
+              h('td', {}, h('span', { class: `dot ${server.status === 'online' ? 'online' : server.status === 'pending' ? 'pending' : 'offline'}` }), h('strong', {}, server.name)),
+              h('td', {}, server.platform),
+              h('td', {}, assessment ? h('span', { class: `score-pill ${scoreClass(assessment.score)}` }, `${assessment.score}`) : h('span', { class: 'muted' }, '—')),
+              h('td', {}, c.critical || 0), h('td', {}, c.high || 0), h('td', {}, c.medium || 0), h('td', {}, c.low || 0),
+              h('td', { class: 'muted' }, assessment ? ago(assessment.created_at) : '—'),
+              h('td', {}, h('div', { class: 'row' },
+                assessment && h('button', { class: 'small', onclick: () => showAssessment(server.id, server.name, draw) }, 'Chi tiết'),
+                can('operator') && server.status !== 'pending' && h('button', { class: 'small primary', onclick: guard(() => runDeepAudit(server.id, draw)) }, assessment ? 'Đánh giá lại' : 'Đánh giá'))));
+          })))
+          : h('div', { class: 'empty' }, 'Chưa có server nào để đánh giá.')));
+  };
+  fill(el, pageHead('Bảo mật', can('operator') && h('button', { onclick: guard(downloadReport) }, '⭳ Tải báo cáo')),
+    h('p', { class: 'muted' }, 'Agent quét sâu từng máy (OS/EOL, phần mềm, firmware/BIOS, cấu hình SSH, tham số nhân, tài khoản, cổng mở), chấm điểm rủi ro và đề xuất cách khắc phục. Nhiều vấn đề có thể tự khắc phục ngay khi bạn bấm 🔧 (cần quyền quản trị).'),
+    box);
+  await draw();
+  every(20000, guard(draw));
 }
 
 async function viewAlerts(el) {

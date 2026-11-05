@@ -156,6 +156,18 @@ const TABLES = (pg) => `
     last_seen TEXT NOT NULL
   );
 
+  -- Deep security assessments: one row per run, keyed to a server.
+  CREATE TABLE IF NOT EXISTS assessments (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    score INTEGER,
+    counts TEXT NOT NULL DEFAULT '{}',
+    findings TEXT NOT NULL DEFAULT '[]',
+    inventory TEXT,
+    created_at TEXT NOT NULL
+  );
+
   -- Network scan: subnets / VLANs discovered, for the topology model.
   CREATE TABLE IF NOT EXISTS network_subnets (
     id TEXT PRIMARY KEY,
@@ -224,6 +236,8 @@ async function migrate(d, pg) {
   await d.run('CREATE UNIQUE INDEX IF NOT EXISTS scanned_devices_org_dkey ON scanned_devices(org_id, dkey)').catch(() => {});
   await d.run('CREATE INDEX IF NOT EXISTS scanned_devices_org ON scanned_devices(org_id)').catch(() => {});
   await d.run('CREATE UNIQUE INDEX IF NOT EXISTS network_subnets_org_cidr ON network_subnets(org_id, cidr)').catch(() => {});
+  await d.run('CREATE INDEX IF NOT EXISTS assessments_server_created ON assessments(server_id, created_at)').catch(() => {});
+  await d.run('CREATE INDEX IF NOT EXISTS assessments_org ON assessments(org_id)').catch(() => {});
 }
 
 function sqliteDriver(file) {
