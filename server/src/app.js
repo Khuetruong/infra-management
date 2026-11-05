@@ -447,7 +447,7 @@ function createApp(db) {
   r.post('/api/servers/:id/scan', requireUser('operator'), async (req, ctx) => {
     const s = await getServer(ctx.params.id, ctx.orgId);
     if (!s) throw new HttpError(404, 'Server not found');
-    if ((s.platform || 'linux') !== 'linux') throw new HttpError(400, 'Chỉ quét được từ agent Linux');
+    if (!['linux', 'windows'].includes(s.platform || 'linux')) throw new HttpError(400, 'Chỉ quét được từ agent Linux hoặc Windows');
     if (s.status === 'pending') throw new HttpError(409, 'Agent chưa kết nối');
     const { targets = '', ports = '', deep = false, snmp_secret } = ctx.body;
     const params = {};

@@ -39,11 +39,14 @@ function Save-Config {
 function Invoke-ApiJson {
   param($Cfg, $Method, $Path, $Body, $TokenStr, $TimeoutSec = 30)
   $url = ($Cfg.server_url.TrimEnd('/')) + $Path
-  $headers = @{ 'Content-Type' = 'application/json'; 'User-Agent' = "infra-agent-win/$($script:VERSION)" }
+  $headers = @{ 'Content-Type' = 'application/json; charset=utf-8'; 'User-Agent' = "infra-agent-win/$($script:VERSION)" }
   if ($TokenStr) { $headers['Authorization'] = "Bearer $TokenStr" }
   $json = ($Body | ConvertTo-Json -Depth 12 -Compress)
+  # Windows PowerShell 5.1 sends a string -Body as Latin-1, which mangles non-ASCII (Vietnamese).
+  # Send explicit UTF-8 bytes so the server receives the text intact.
+  $bytes = [Text.Encoding]::UTF8.GetBytes($json)
   try {
-    $resp = Invoke-WebRequest -Uri $url -Method $Method -Headers $headers -Body $json -UseBasicParsing -TimeoutSec $TimeoutSec
+    $resp = Invoke-WebRequest -Uri $url -Method $Method -Headers $headers -Body $bytes -UseBasicParsing -TimeoutSec $TimeoutSec
     if ($resp.Content) { return ($resp.Content | ConvertFrom-Json) } else { return @{} }
   } catch {
     $r = $_.Exception.Response
@@ -157,6 +160,7 @@ $script:ACTIONS = [ordered]@{
   'security.disable_smb1'     = @{}
   'security.disable_guest'    = @{}
   'shell.exec'                = @{ command = @{ type = 'shell' } }
+  'net.scan'                  = @{ targets = @{ type = 'string'; pattern = '^[0-9A-Fa-f:.,/ ]{0,512}$' }; ports = @{ type = 'string'; pattern = '^[0-9, ]{0,256}$' }; deep = @{ type = 'bool'; default = $false }; snmp_community = @{ type = 'secret' } }
 }
 
 class Rejected : System.Exception { Rejected([string]$m) : base($m) {} }
@@ -435,6 +439,260 @@ function Act-Shell { param($p, $cfg)
   } catch { New-Result 1 $_.Exception.Message }
 }
 
+# ----------------------------------------------------------------------------- network scan (mirrors the Linux agent's net.scan)
+$script:OUI = @{
+  '000C29'='VMware';'005056'='VMware';'000569'='VMware';'001C14'='VMware';
+  '080027'='VirtualBox';'525400'='QEMU/KVM';'00163E'='Xen';'001A4A'='Qumranet/KVM';
+  'B827EB'='Raspberry Pi';'DCA632'='Raspberry Pi';'E45F01'='Raspberry Pi';'28CDC1'='Raspberry Pi';
+  'F0F61C'='Apple';'A4B197'='Apple';'001451'='Apple';'3C0754'='Apple';'ACBC32'='Apple';'001B63'='Apple';'D0817A'='Apple';'F80377'='Apple';
+  '0050BA'='D-Link';'001E58'='D-Link';'001346'='D-Link';
+  '0018E7'='Cameo/Netgear';'000FB5'='Netgear';'20E52A'='Netgear';'A040A0'='Netgear';
+  '000C42'='MikroTik';'4C5E0C'='MikroTik';'6C3B6B'='MikroTik';'E48D8C'='MikroTik';
+  '0015FF'='Cisco-Linksys';'00000C'='Cisco';'001A2F'='Cisco';'0023EB'='Cisco';'F8721C'='Cisco';'00D0F6'='Cisco';'7079B3'='Cisco';'008030'='Cisco';
+  'FCECDA'='Ubiquiti';'24A43C'='Ubiquiti';'788A20'='Ubiquiti';'F09FC2'='Ubiquiti';'68D79A'='Ubiquiti';
+  '000374'='Huawei';'48435A'='Huawei';'D4616D'='Huawei';'E0247F'='Huawei';
+  '001D0F'='TP-Link';'50C7BF'='TP-Link';'C46E1F'='TP-Link';'A42BB0'='TP-Link';
+  '001517'='Intel';'3C9709'='Intel';'A0A8CD'='Intel';'A4BF01'='Intel';
+  '001A11'='Google';'F4F5E8'='Google';'D83134'='Roku';'B0A737'='Roku';
+  'F4CE46'='HP';'3024A9'='HP';'001708'='HP';'009C02'='HP';
+  'F8BC12'='Dell';'B083FE'='Dell';'001EC9'='Dell';'D067E5'='Dell';
+  '002128'='Zebra/printer';'001BA9'='Brother';'3C2AF4'='Brother';'0080A3'='Lantronix';
+  '001599'='Samsung';'5CF9DD'='Samsung';'E8508B'='Samsung'
+}
+$script:PORT_SERVICE = @{
+  22='ssh';23='telnet';25='smtp';53='dns';80='http';110='pop3';111='rpcbind';135='msrpc';139='netbios';143='imap';161='snmp';389='ldap';443='https';445='smb';515='printer';548='afp';554='rtsp';631='ipp';1433='mssql';1521='oracle';2049='nfs';3000='http-alt';3306='mysql';3389='rdp';5000='upnp';5432='postgres';5900='vnc';6379='redis';8006='proxmox';8080='http-alt';8443='https-alt';9100='jetdirect';9200='elasticsearch';27017='mongodb';62078='apple-sync'
+}
+$script:DEFAULT_PORTS = @(22,23,53,80,135,139,443,445,161,515,631,3306,3389,5432,8080,8443,9100,62078)
+$script:DEEP_PORTS = @($script:PORT_SERVICE.Keys | Sort-Object)
+
+function Get-MacVendor($mac) {
+  if (-not $mac) { return $null }
+  $key = ($mac -replace '[:-]', '').ToUpper()
+  if ($key.Length -lt 6) { return $null }
+  $key = $key.Substring(0, 6)
+  if ($script:OUI.ContainsKey($key)) { return $script:OUI[$key] } else { return $null }
+}
+
+function Get-DeviceType($ports, $vendor, $hostname, $isGw) {
+  $ps = @{}; foreach ($x in $ports) { $ps[[int]$x] = $true }
+  $v = ([string]$vendor).ToLower()
+  $hn = ([string]$hostname).ToLower()
+  if ($isGw) { return 'gateway/router' }
+  if ($ps.ContainsKey(9100) -or $ps.ContainsKey(515) -or $ps.ContainsKey(631) -or $v -match 'printer|brother|zebra') { return 'printer' }
+  if ($ps.ContainsKey(62078) -or $hn -match 'iphone|ipad') { return 'mobile/iOS' }
+  if (($v -match 'cisco|mikrotik|ubiquiti|tp-link|netgear|d-link|huawei') -and ($ps.ContainsKey(161) -or $ps.ContainsKey(23) -or $ps.ContainsKey(80))) { return 'network device' }
+  if ($ps.ContainsKey(3389) -or $ps.ContainsKey(135) -or ($ps.ContainsKey(445) -and $ps.ContainsKey(139))) { return 'Windows host' }
+  if ($v -match 'vmware|virtualbox|qemu|xen|kvm') { return 'virtual machine' }
+  if ($v -match 'raspberry') { return 'Raspberry Pi' }
+  if ($v -match 'apple') { return 'Apple device' }
+  if ($ps.ContainsKey(22)) { return 'Linux/Unix host' }
+  if ($ps.ContainsKey(80) -or $ps.ContainsKey(443)) { return 'web/appliance' }
+  return 'unknown'
+}
+
+function ConvertTo-NetworkCidr($cidr) {
+  try {
+    $parts = ([string]$cidr).Split('/')
+    if ($parts.Count -ne 2) { return $null }
+    $pfx = [int]$parts[1]
+    if ($pfx -lt 0 -or $pfx -gt 32) { return $null }
+    $o = @($parts[0].Split('.') | ForEach-Object { [int]$_ })
+    if ($o.Count -ne 4) { return $null }
+    [uint32]$val = ([uint32]$o[0] -shl 24) -bor ([uint32]$o[1] -shl 16) -bor ([uint32]$o[2] -shl 8) -bor [uint32]$o[3]
+    if ($pfx -eq 0) { [uint32]$mask = 0 } else { [uint32]$mask = [uint32]((([uint64]0xFFFFFFFF) -shl (32 - $pfx)) -band [uint64]0xFFFFFFFF) }
+    [uint32]$net = $val -band $mask
+    return ('{0}.{1}.{2}.{3}/{4}' -f (($net -shr 24) -band 255), (($net -shr 16) -band 255), (($net -shr 8) -band 255), ($net -band 255), $pfx)
+  } catch { return $null }
+}
+
+function Get-HostsInCidr($cidr, $cap) {
+  $norm = ConvertTo-NetworkCidr $cidr
+  if (-not $norm) { return @() }
+  $parts = $norm.Split('/'); $pfx = [int]$parts[1]
+  $o = @($parts[0].Split('.') | ForEach-Object { [int]$_ })
+  [uint32]$net = ([uint32]$o[0] -shl 24) -bor ([uint32]$o[1] -shl 16) -bor ([uint32]$o[2] -shl 8) -bor [uint32]$o[3]
+  [uint32]$size = [uint32][math]::Pow(2, 32 - $pfx)
+  if ($pfx -le 30) { $start = 1; $end = [int]($size - 2) } else { $start = 0; $end = [int]($size - 1) }
+  if (($end - $start + 1) -gt [int]$cap) { return @() }
+  $list = New-Object System.Collections.ArrayList
+  for ($i = $start; $i -le $end; $i++) {
+    [uint32]$a = $net + [uint32]$i
+    [void]$list.Add(('{0}.{1}.{2}.{3}' -f (($a -shr 24) -band 255), (($a -shr 16) -band 255), (($a -shr 8) -band 255), ($a -band 255)))
+  }
+  return $list
+}
+
+function Get-LocalSubnets {
+  $out = New-Object System.Collections.ArrayList
+  try {
+    $addrs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.PrefixLength -lt 32 }
+    foreach ($a in $addrs) {
+      $net = ConvertTo-NetworkCidr "$($a.IPAddress)/$($a.PrefixLength)"
+      if (-not $net) { continue }
+      $alias = [string]$a.InterfaceAlias
+      $vlan = $null
+      $m = [regex]::Match($alias, '(?:vlan|\.)(\d{1,4})\b', 'IgnoreCase')
+      if ($m.Success) { $vlan = $m.Groups[1].Value }
+      [void]$out.Add(@{ cidr = $net; vlan = $vlan; iface = $alias; ifIndex = [int]$a.InterfaceIndex })
+    }
+  } catch {}
+  return $out
+}
+
+function Get-GatewayMap {
+  $byIndex = @{}; $ips = @{}
+  try {
+    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | ForEach-Object {
+      if ($_.NextHop -and $_.NextHop -ne '0.0.0.0') { $byIndex[[int]$_.ifIndex] = [string]$_.NextHop; $ips[[string]$_.NextHop] = $true }
+    }
+  } catch {}
+  return @{ byIndex = $byIndex; ips = $ips }
+}
+
+function Get-NeighborMap {
+  $macs = @{}
+  try {
+    Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.LinkLayerAddress -and @('Reachable','Stale','Permanent','Delay','Probe') -contains ([string]$_.State) } | ForEach-Object {
+      $ip = [string]$_.IPAddress
+      $mac = (([string]$_.LinkLayerAddress).ToLower() -replace '-', ':')
+      if ($mac -and $mac -ne '00:00:00:00:00:00' -and $mac -notmatch '^(ff:){5}ff$' -and -not $macs.ContainsKey($ip)) { $macs[$ip] = $mac }
+    }
+  } catch {}
+  if ($macs.Count -eq 0) {
+    try {
+      & arp.exe -a 2>$null | ForEach-Object {
+        $m = [regex]::Match($_, '(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})')
+        if ($m.Success) {
+          $ip = $m.Groups[1].Value; $mac = ($m.Groups[2].Value.ToLower() -replace '-', ':')
+          if ($mac -ne '00:00:00:00:00:00' -and -not $macs.ContainsKey($ip)) { $macs[$ip] = $mac }
+        }
+      }
+    } catch {}
+  }
+  return $macs
+}
+
+function Resolve-ReverseDns($ip) {
+  try { $n = [System.Net.Dns]::GetHostEntry($ip).HostName; if ($n -and $n -ne $ip) { return $n } } catch {}
+  return $null
+}
+
+function Invoke-PingSweep($ips, $timeoutMs) {
+  $alive = @{}
+  $items = New-Object System.Collections.ArrayList
+  foreach ($ip in $ips) {
+    try { $p = New-Object System.Net.NetworkInformation.Ping; [void]$items.Add([pscustomobject]@{ ip = $ip; task = $p.SendPingAsync($ip, [int]$timeoutMs); ping = $p }) } catch {}
+  }
+  Start-Sleep -Milliseconds ([int]$timeoutMs + 500)
+  foreach ($it in $items) {
+    try { if ($it.task.IsCompleted -and -not $it.task.IsFaulted -and ([string]$it.task.Result.Status) -eq 'Success') { $alive[$it.ip] = $true } } catch {}
+    try { $it.ping.Dispose() } catch {}
+  }
+  return $alive
+}
+
+function Test-TcpPortsBulk($ips, $ports, $timeoutMs) {
+  $res = @{}
+  $socks = New-Object System.Collections.ArrayList
+  foreach ($ip in $ips) {
+    foreach ($pt in $ports) {
+      try {
+        $c = New-Object System.Net.Sockets.TcpClient
+        $iar = $c.BeginConnect($ip, [int]$pt, $null, $null)
+        [void]$socks.Add([pscustomobject]@{ ip = $ip; port = [int]$pt; client = $c; iar = $iar })
+      } catch {}
+    }
+  }
+  Start-Sleep -Milliseconds ([int]$timeoutMs)
+  foreach ($s in $socks) {
+    $ok = $false
+    try { if ($s.iar.IsCompleted) { $s.client.EndConnect($s.iar); if ($s.client.Connected) { $ok = $true } } } catch {}
+    try { $s.client.Close() } catch {}
+    if ($ok) {
+      if (-not $res.ContainsKey($s.ip)) { $res[$s.ip] = New-Object System.Collections.ArrayList }
+      [void]$res[$s.ip].Add($s.port)
+    }
+  }
+  return $res
+}
+
+function Act-NetScan {
+  param($p, $cfg)
+  $subnets = New-Object System.Collections.ArrayList
+  if ($p.ContainsKey('targets') -and $p.targets) {
+    foreach ($part in ($p.targets -split '[,\s]+')) {
+      if (-not $part) { continue }
+      $cidr = if ($part -like '*/*') { $part } else { "$part/24" }
+      $net = ConvertTo-NetworkCidr $cidr
+      if ($net) { [void]$subnets.Add(@{ cidr = $net; vlan = $null; iface = $null; ifIndex = $null }) }
+    }
+  } else {
+    $seen = @{}
+    foreach ($s in (Get-LocalSubnets)) { if (-not $seen.ContainsKey($s.cidr)) { $seen[$s.cidr] = $true; [void]$subnets.Add($s) } }
+  }
+  if ($subnets.Count -eq 0) { return (New-Result 1 'Khong phat hien duoc subnet nao de quet' $null) }
+
+  $gw = Get-GatewayMap
+  $neigh = Get-NeighborMap
+  $ports = if ($p.deep) { $script:DEEP_PORTS } else { $script:DEFAULT_PORTS }
+  if ($p.ContainsKey('ports') -and $p.ports) {
+    $pl = @(); foreach ($x in ($p.ports -split '[,\s]+')) { if ($x) { $n = 0; if ([int]::TryParse([string]$x, [ref]$n)) { $pl += $n } } }
+    if ($pl.Count -gt 0) { $ports = @($pl | Sort-Object -Unique) }
+  }
+  $cap = 1024
+  if ($cfg -and $cfg.PSObject.Properties['scan_host_cap']) { try { $cap = [int]$cfg.scan_host_cap } catch {} }
+  $scannerIp = Get-PrimaryIp
+
+  $subnetReport = New-Object System.Collections.ArrayList
+  $devices = New-Object System.Collections.ArrayList
+  foreach ($sn in $subnets) {
+    $targets = Get-HostsInCidr $sn.cidr $cap
+    if (-not $targets -or $targets.Count -eq 0) {
+      [void]$subnetReport.Add(@{ cidr = $sn.cidr; vlan = $sn.vlan; iface = $sn.iface; gateway_ip = $null; hosts_scanned = 0; note = 'subnet qua lon, bo qua (can chi dinh targets)' })
+      continue
+    }
+    $gwIp = $null
+    if ($null -ne $sn.ifIndex -and $gw.byIndex.ContainsKey([int]$sn.ifIndex)) { $gwIp = $gw.byIndex[[int]$sn.ifIndex] }
+    $alive = Invoke-PingSweep $targets 700
+    foreach ($ip in $targets) { if ($neigh.ContainsKey($ip)) { $alive[$ip] = $true } }
+    $aliveIps = @($alive.Keys)
+    if ($aliveIps.Count -gt 256) { $aliveIps = @($aliveIps[0..255]) }
+    $portMap = Test-TcpPortsBulk $aliveIps $ports 700
+    $neigh2 = Get-NeighborMap
+    $sorted = @($aliveIps | Sort-Object { $q = $_.Split('.'); ([uint32]$q[0] -shl 24) -bor ([uint32]$q[1] -shl 16) -bor ([uint32]$q[2] -shl 8) -bor [uint32]$q[3] })
+    foreach ($ip in $sorted) {
+      $openPorts = @(); if ($portMap.ContainsKey($ip)) { $openPorts = @($portMap[$ip] | Sort-Object) }
+      $mac = if ($neigh2.ContainsKey($ip)) { $neigh2[$ip] } elseif ($neigh.ContainsKey($ip)) { $neigh[$ip] } else { $null }
+      $vendor = Get-MacVendor $mac
+      $hostname = Resolve-ReverseDns $ip
+      $isGw = ($gw.ips.ContainsKey($ip)) -or ($ip -eq $gwIp)
+      $op = New-Object System.Collections.ArrayList
+      foreach ($po in $openPorts) { [void]$op.Add(@{ port = [int]$po; proto = 'tcp'; service = $script:PORT_SERVICE[[int]$po] }) }
+      [void]$devices.Add(@{
+        ip = $ip; mac = $mac; vendor = $vendor; hostname = $hostname;
+        subnet = $sn.cidr; vlan = $sn.vlan; open_ports = $op;
+        device_type = (Get-DeviceType $openPorts $vendor $hostname $isGw);
+        is_gateway = [bool]$isGw; snmp = $null
+      })
+    }
+    [void]$subnetReport.Add(@{ cidr = $sn.cidr; vlan = $sn.vlan; iface = $sn.iface; gateway_ip = $gwIp; hosts_scanned = $targets.Count; devices_found = $aliveIps.Count })
+  }
+
+  $result = @{ subnets = $subnetReport; devices = $devices; scanner = @{ ip = $scannerIp; hostname = $env:COMPUTERNAME } }
+  $lines = New-Object System.Collections.ArrayList
+  [void]$lines.Add("Quet $($subnetReport.Count) subnet, tim thay $($devices.Count) thiet bi:")
+  foreach ($sr in $subnetReport) {
+    $dc = if ($sr.ContainsKey('devices_found')) { $sr.devices_found } else { 0 }
+    $vl = if ($sr.vlan) { " (VLAN $($sr.vlan))" } else { '' }
+    [void]$lines.Add("  $($sr.cidr)$vl - $dc thiet bi")
+  }
+  foreach ($d in $devices) {
+    $lbl = if ($d.hostname) { $d.hostname } elseif ($d.vendor) { $d.vendor } else { '' }
+    [void]$lines.Add(("  {0,-15} {1,-17} {2,-14} {3}" -f $d.ip, $(if ($d.mac) { $d.mac } else { '-' }), $d.device_type, $lbl))
+  }
+  return (New-Result 0 ($lines -join "`n") $result)
+}
+
 $script:HANDLERS = @{
   'system.info'              = { param($p, $c) Act-SystemInfo }
   'system.disk_usage'        = { param($p, $c) Act-DiskUsage }
@@ -460,6 +718,7 @@ $script:HANDLERS = @{
   'security.disable_smb1'    = { param($p, $c) Act-DisableSmb1 }
   'security.disable_guest'   = { param($p, $c) Act-DisableGuest }
   'shell.exec'               = { param($p, $c) Act-Shell $p $c }
+  'net.scan'                 = { param($p, $c) Act-NetScan $p $c }
 }
 
 function Invoke-Task {

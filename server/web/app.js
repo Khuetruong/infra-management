@@ -609,7 +609,10 @@ async function viewNetwork(el) {
     api('GET', '/api/servers'),
     can('operator') ? api('GET', '/api/secrets') : Promise.resolve({ secrets: [] }),
   ]);
-  const scanners = servers.filter((s2) => (s2.platform || 'linux') === 'linux' && s2.status !== 'pending');
+  // Any online agent that advertises net.scan can be a scanner (Linux or Windows).
+  const scanners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.scan'));
+  // Remote agent install/uninstall rides over SSH from a Linux scanner only.
+  const sshRunners = servers.filter((s2) => (s2.platform || 'linux') === 'linux' && s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.remote_install'));
   const serverById = Object.fromEntries(servers.map((x) => [x.id, x]));
   const box = h('div', {});
 
@@ -623,15 +626,15 @@ async function viewNetwork(el) {
     h('td', {}, h('span', { class: `badge b-${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'open'}` }, DEVICE_STATUS_LABEL[d.status] || d.status),
       d.managed_server_id ? h('div', {}, h('a', { href: `#/servers/${d.managed_server_id}` }, 'mở server')) : null),
     h('td', {}, h('div', { class: 'row' },
-      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => manageAgentDialog(d, scanners, secretsRes.secrets, guard(draw), 'install') }, 'Kết nối'),
-      can('admin') && d.status === 'managed' && h('button', { class: 'small', onclick: () => manageAgentDialog(d, scanners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
+      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'install') }, 'Kết nối'),
+      can('admin') && d.status === 'managed' && h('button', { class: 'small', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
       can('operator') && h('button', { class: 'small danger', onclick: guard(async () => { await api('DELETE', `/api/devices/${d.id}`); draw(); }) }, 'Xoá'))));
 
   async function draw() {
     const { subnets } = await api('GET', '/api/topology');
     if (!subnets.length) {
       fill(box, h('div', { class: 'panel empty' },
-        'Chưa có dữ liệu quét. Bấm "Quét mạng" và chọn một agent Linux đang online để quét toàn bộ thiết bị trong hạ tầng (IP, MAC, hãng, cổng mở, loại thiết bị). Nếu có nhiều VLAN, mỗi dải mạng sẽ được quét và vẽ sơ đồ riêng.'));
+        'Chưa có dữ liệu quét. Bấm "Quét mạng" và chọn một agent (Linux hoặc Windows) đang online để quét toàn bộ thiết bị trong hạ tầng (IP, MAC, hãng, cổng mở, loại thiết bị). Nếu có nhiều VLAN, mỗi dải mạng sẽ được quét và vẽ sơ đồ riêng.'));
       return;
     }
     // group subnets by VLAN
@@ -663,7 +666,7 @@ async function viewNetwork(el) {
 }
 
 function scanDialog(scanners, secrets, onDone) {
-  if (!scanners.length) return void toast('Cần ít nhất một agent Linux đang online để quét', true);
+  if (!scanners.length) return void toast('Cần ít nhất một agent (Linux hoặc Windows) đang online để quét', true);
   const scanner = h('select', {}, scanners.map((x) => h('option', { value: x.id }, `${x.name} (${x.ip || x.hostname || x.id})`)));
   const targets = h('input', { placeholder: 'để trống = tự dò các dải mạng; vd: 192.168.1.0/24, 10.0.0.0/24' });
   const ports = h('input', { placeholder: 'để trống = bộ cổng phổ biến; vd: 22,80,443,3389' });
@@ -681,7 +684,7 @@ function scanDialog(scanners, secrets, onDone) {
       showTask(task.id);
     }),
   },
-  h('label', {}, 'Agent quét (Linux, đang online)'), scanner,
+  h('label', {}, 'Agent quét (đang online)'), scanner,
   h('label', {}, 'Dải mạng cần quét'), targets,
   h('label', {}, 'Cổng cần kiểm tra'), ports,
   h('label', { class: 'check' }, deep, 'Quét sâu (nhiều cổng hơn, chậm hơn)'),
@@ -757,12 +760,15 @@ const scoreClass = (s) => (s == null ? '' : s < 60 ? 'crit' : s < 80 ? 'warn' : 
 
 async function runDeepAudit(serverId, onDone) {
   const { task } = await api('POST', `/api/servers/${serverId}/tasks`, { action: 'security.deep_audit', params: {} });
-  toast('Đang đánh giá bảo mật chuyên sâu…');
-  showTask(task.id);
-  // poll until the assessment is stored, then refresh
+  // Non-blocking: dispatch and let the user keep working. No result modal to wait on;
+  // the assessment/report refreshes by itself when the agent finishes.
+  toast('Đã bắt đầu đánh giá chuyên sâu — chạy nền, kết quả sẽ tự hiện khi xong.');
   const t = setInterval(async () => {
     const r = await api('GET', `/api/tasks/${task.id}`).catch(() => null);
-    if (r && !['queued', 'dispatched'].includes(r.task.status)) { clearInterval(t); onDone(); }
+    if (!r || ['queued', 'dispatched'].includes(r.task.status)) return;
+    clearInterval(t);
+    toast(r.task.status === 'succeeded' ? 'Đánh giá hoàn tất, đã cập nhật kết quả.' : ('Đánh giá không thành công: ' + (r.task.error || r.task.status)));
+    if (onDone) onDone();
   }, 2500);
 }
 

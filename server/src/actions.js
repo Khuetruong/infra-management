@@ -51,7 +51,7 @@ const ACTIONS = {
   'db.backups.list':      { category: 'database', title: 'Danh sách file backup trên server', minRole: 'viewer', params: {} },
 
   // ---- network discovery & remote onboarding (agent must run on Linux) ----
-  'net.scan':             { category: 'network',  title: 'Quét hạ tầng mạng', minRole: 'operator', platforms: ['linux'], params: {
+  'net.scan':             { category: 'network',  title: 'Quét hạ tầng mạng', minRole: 'operator', platforms: ['linux', 'windows'], params: {
     targets: { type: 'string', pattern: '[0-9A-Fa-f:.,/ ]{0,512}' },
     ports: { type: 'string', pattern: '[0-9, ]{0,256}' },
     deep: { type: 'bool', default: false },
