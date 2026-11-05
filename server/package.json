@@ -1,0 +1,20 @@
+{
+  "name": "infra-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control plane API: users/RBAC, server enrollment, agent task queue, secrets vault, alerts, audit log",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --no-warnings src/index.js",
+    "create-admin": "node --no-warnings src/cli.js create-admin",
+    "test": "node --no-warnings --test test/*.test.js",
+    "vercel-build": "node scripts/prepare-bundle.js",
+    "prepare-bundle": "node scripts/prepare-bundle.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
