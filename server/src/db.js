@@ -50,7 +50,6 @@ const TABLES = (pg) => `
     created_at TEXT NOT NULL,
     enrolled_by TEXT
   );
-  CREATE INDEX IF NOT EXISTS servers_org ON servers(org_id);
 
   CREATE TABLE IF NOT EXISTS enrollment_tokens (
     id TEXT PRIMARY KEY,
@@ -94,7 +93,6 @@ const TABLES = (pg) => `
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS secrets_org_name ON secrets(org_id, name);
 
   CREATE TABLE IF NOT EXISTS alerts (
     id TEXT PRIMARY KEY,
@@ -109,7 +107,6 @@ const TABLES = (pg) => `
     updated_at TEXT NOT NULL,
     acknowledged_by TEXT
   );
-  CREATE INDEX IF NOT EXISTS alerts_status ON alerts(org_id, status);
 
   CREATE TABLE IF NOT EXISTS metrics_history (
     server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -185,6 +182,10 @@ async function migrate(d, pg) {
     const owner = await d.one("SELECT id FROM users WHERE role = 'owner' ORDER BY created_at LIMIT 1");
     if (owner) await d.run('UPDATE users SET platform_admin = 1 WHERE id = ?', owner.id);
   }
+  // 4. indexes that reference org_id — created here (after the columns exist) so an
+  //    older database that predates multi-tenancy can be upgraded in place.
+  await d.run('CREATE INDEX IF NOT EXISTS servers_org ON servers(org_id)').catch(() => {});
+  await d.run('CREATE INDEX IF NOT EXISTS alerts_status ON alerts(org_id, status)').catch(() => {});
   await d.run('CREATE UNIQUE INDEX IF NOT EXISTS secrets_org_name ON secrets(org_id, name)').catch(() => {});
 }
 
