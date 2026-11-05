@@ -55,9 +55,17 @@ function Install-InfraAgent {
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -ExecutionTimeLimit ([TimeSpan]::Zero)
+  # Make updates clean: stop the task and kill any agent loop still running the old script,
+  # so re-running the installer refreshes the agent instead of leaving two copies running
+  # (two copies flap the reported capabilities and double-dispatch tasks).
   if (Get-ScheduledTask -TaskName $script:InfraTask -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $script:InfraTask -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $script:InfraTask -Confirm:$false
   }
+  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match 'infra_agent\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Milliseconds 500
   Register-ScheduledTask -TaskName $script:InfraTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Infra management agent (outbound-only control plane agent)' | Out-Null
   Start-ScheduledTask -TaskName $script:InfraTask
   Write-Host 'infra-agent đã cài và đang chạy (Task Scheduler -> InfraAgent).'
