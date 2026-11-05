@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   Infra agent for Windows. Connects a Windows server to the control plane.
   - Outbound only: polls the control plane over HTTPS; opens no inbound port.
@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $script:VERSION = '0.1.0'
 $script:MAX_OUTPUT = 200 * 1024
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocol]::Tls12 -bor [Net.SecurityProtocol]::Tls11
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 function Write-Log { param([Parameter(ValueFromRemainingArguments = $true)]$m) Write-Host ((Get-Date).ToString('s') + ' ' + ($m -join ' ')) }
 

@@ -29,7 +29,7 @@ function Install-InfraAgent {
     [switch]$InsecureHttp
   )
   Assert-Admin
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocol]::Tls12 -bor [Net.SecurityProtocol]::Tls11
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
   if (-not (Test-Path $script:InfraBase)) { New-Item -ItemType Directory -Force -Path $script:InfraBase | Out-Null }
 
   # download the agent script
