@@ -66,6 +66,33 @@ ACTIONS = {
     "db.mysql.status": {"user": ("str", NAME, "root"), "password": ("secret",)},
     "db.mysql.backup": {"database": ("str", DBNAME, None), "user": ("str", NAME, "root"), "password": ("secret",)},
     "db.backups.list": {},
+    # ---- network discovery & remote onboarding ----
+    "net.scan": {
+        "targets": ("str?", r"[0-9A-Fa-f:.,/ ]{0,512}", None),
+        "ports": ("str?", r"[0-9, ]{0,256}", None),
+        "deep": ("bool", False),
+        "snmp_community": ("secret",),
+    },
+    "net.remote_install": {
+        "host": ("str", IP, None),
+        "os": ("enum", ("linux", "windows"), "linux"),
+        "ssh_user": ("str", NAME, "root"),
+        "ssh_port": ("int", 1, 65535, 22),
+        "server_url": ("str", r"https?://[^\s]{3,256}", None),
+        "enroll_token": ("str", r"[A-Za-z0-9_-]{8,160}", None),
+        "ssh_password": ("secret",),
+        "ssh_key": ("secret",),
+    },
+    "net.remote_uninstall": {
+        "host": ("str", IP, None),
+        "os": ("enum", ("linux", "windows"), "linux"),
+        "ssh_user": ("str", NAME, "root"),
+        "ssh_port": ("int", 1, 65535, 22),
+        "server_url": ("str", r"https?://[^\s]{3,256}", None),
+        "purge": ("bool", False),
+        "ssh_password": ("secret",),
+        "ssh_key": ("secret",),
+    },
     "shell.exec": {"command": ("shell",)},
 }
 
@@ -599,6 +626,409 @@ def a_shell(p, cfg):
     return sh(["/bin/sh", "-c", p["command"]], timeout=int(cfg.get("shell_timeout", 300))) + (None,)
 
 
+# ----------------------------------------------------------------------------- network scan
+# Small built-in OUI (MAC vendor prefix) table — best-effort labelling only.
+OUI = {
+    "000C29": "VMware", "005056": "VMware", "000569": "VMware", "001C14": "VMware",
+    "080027": "VirtualBox", "525400": "QEMU/KVM", "00163E": "Xen", "001A4A": "Qumranet/KVM",
+    "B827EB": "Raspberry Pi", "DCA632": "Raspberry Pi", "E45F01": "Raspberry Pi", "28CDC1": "Raspberry Pi",
+    "F0F61C": "Apple", "A4B197": "Apple", "001451": "Apple", "3C0754": "Apple", "ACBC32": "Apple",
+    "001B63": "Apple", "D0817A": "Apple", "F80377": "Apple",
+    "0050BA": "D-Link", "001E58": "D-Link", "001346": "D-Link",
+    "0018E7": "Cameo/Netgear", "000FB5": "Netgear", "20E52A": "Netgear", "A040A0": "Netgear",
+    "000C42": "Routerboard/MikroTik", "4C5E0C": "MikroTik", "6C3B6B": "MikroTik", "E48D8C": "MikroTik",
+    "0015FF": "Cisco-Linksys", "00000C": "Cisco", "001A2F": "Cisco", "0023EB": "Cisco", "F8721C": "Cisco",
+    "00D0F6": "Cisco", "7079B3": "Cisco", "008030": "Cisco",
+    "FCECDA": "Ubiquiti", "24A43C": "Ubiquiti", "788A20": "Ubiquiti", "F09FC2": "Ubiquiti", "68D79A": "Ubiquiti",
+    "000374": "Huawei", "48435A": "Huawei", "D4616D": "Huawei", "E0247F": "Huawei",
+    "001D0F": "TP-Link", "50C7BF": "TP-Link", "C46E1F": "TP-Link", "A42BB0": "TP-Link",
+    "001517": "Intel", "3C9709": "Intel", "A0A8CD": "Intel", "A4BF01": "Intel",
+    "001A11": "Google", "F4F5E8": "Google", "D83134": "Roku", "B0A737": "Roku",
+    "F4CE46": "HP", "3024A9": "HP", "001708": "HP", "009C02": "HP",
+    "F8BC12": "Dell", "B083FE": "Dell", "001EC9": "Dell", "D067E5": "Dell",
+    "002128": "Zebra/printer", "001BA9": "Brother", "3C2AF4": "Brother", "0080A3": "Lantronix",
+    "001599": "Samsung", "5CF9DD": "Samsung", "E8508B": "Samsung",
+}
+
+
+def mac_vendor(mac):
+    if not mac:
+        return None
+    key = mac.replace(":", "").replace("-", "").upper()[:6]
+    return OUI.get(key)
+
+
+PORT_SERVICE = {
+    22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 110: "pop3", 111: "rpcbind",
+    135: "msrpc", 139: "netbios", 143: "imap", 161: "snmp", 389: "ldap", 443: "https",
+    445: "smb", 515: "printer", 548: "afp", 554: "rtsp", 631: "ipp", 1433: "mssql",
+    1521: "oracle", 2049: "nfs", 3000: "http-alt", 3306: "mysql", 3389: "rdp", 5000: "upnp",
+    5432: "postgres", 5900: "vnc", 6379: "redis", 8006: "proxmox", 8080: "http-alt",
+    8443: "https-alt", 9100: "jetdirect", 9200: "elasticsearch", 27017: "mongodb", 62078: "apple-sync",
+}
+DEFAULT_PORTS = [22, 23, 53, 80, 135, 139, 443, 445, 161, 515, 631, 3306, 3389, 5432, 8080, 8443, 9100, 62078]
+DEEP_PORTS = sorted(PORT_SERVICE)
+
+
+def guess_device_type(ports, vendor, hostname, is_gateway):
+    ps = set(ports)
+    v = (vendor or "").lower()
+    h = (hostname or "").lower()
+    if is_gateway:
+        return "gateway/router"
+    if {9100, 515, 631} & ps or "printer" in v or "brother" in v or "zebra" in v:
+        return "printer"
+    if 62078 in ps or "iphone" in h or "ipad" in h:
+        return "mobile/iOS"
+    if any(k in v for k in ("cisco", "mikrotik", "ubiquiti", "tp-link", "netgear", "d-link", "huawei")) and (161 in ps or 23 in ps or 80 in ps):
+        return "network device"
+    if {3389, 135} & ps or (445 in ps and 139 in ps):
+        return "Windows host"
+    if "vmware" in v or "virtualbox" in v or "qemu" in v or "xen" in v or "kvm" in v:
+        return "virtual machine"
+    if "raspberry" in v:
+        return "Raspberry Pi"
+    if "apple" in v:
+        return "Apple device"
+    if 22 in ps:
+        return "Linux/Unix host"
+    if {80, 443} & ps:
+        return "web/appliance"
+    return "unknown"
+
+
+def local_subnets():
+    """Return [{cidr, vlan, iface}] for connected IPv4 networks, excluding loopback."""
+    out = []
+    code, text = sh(["ip", "-o", "-4", "addr", "show"], timeout=15)
+    if code != 0:
+        return out
+    for line in text.splitlines():
+        cols = line.split()
+        # e.g. "2: eth0    inet 192.168.1.5/24 brd ... scope global eth0"
+        if len(cols) < 4 or cols[2] != "inet":
+            continue
+        iface, cidr = cols[1], cols[3]
+        if cidr.startswith("127.") or "/32" in cidr:
+            continue
+        net = cidr_network(cidr)
+        if not net:
+            continue
+        vlan = None
+        m = re.search(r"\.(\d{1,4})$", iface) or re.search(r"vlan(\d{1,4})", iface)
+        if m:
+            vlan = m.group(1)
+        out.append({"cidr": net, "vlan": vlan, "iface": iface})
+    return out
+
+
+def default_gateways():
+    gws = {}
+    code, text = sh(["ip", "-o", "-4", "route", "show"], timeout=15)
+    if code == 0:
+        for line in text.splitlines():
+            m = re.search(r"default via (\d+\.\d+\.\d+\.\d+) dev (\S+)", line)
+            if m:
+                gws[m.group(2)] = m.group(1)
+    return gws
+
+
+def neighbor_table():
+    """ip -> mac from the ARP/neighbour cache."""
+    macs = {}
+    code, text = sh(["ip", "-4", "neigh", "show"], timeout=15)
+    if code == 0:
+        for line in text.splitlines():
+            m = re.match(r"(\d+\.\d+\.\d+\.\d+).*lladdr ([0-9a-fA-F:]{17})", line)
+            if m:
+                macs[m.group(1)] = m.group(2).lower()
+    for line in read("/proc/net/arp").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 4 and f[3] != "00:00:00:00:00:00":
+            macs.setdefault(f[0], f[3].lower())
+    return macs
+
+
+def cidr_network(cidr):
+    """Normalise 'ip/prefix' to the network address 'net/prefix' (IPv4 only)."""
+    try:
+        ip, _, pfx = cidr.partition("/")
+        pfx = int(pfx)
+        octets = [int(x) for x in ip.split(".")]
+        if len(octets) != 4 or not (0 <= pfx <= 32):
+            return None
+        val = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+        mask = (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF if pfx else 0
+        net = val & mask
+        return "%d.%d.%d.%d/%d" % ((net >> 24) & 255, (net >> 16) & 255, (net >> 8) & 255, net & 255, pfx)
+    except (ValueError, IndexError):
+        return None
+
+
+def hosts_in(cidr, cap=1024):
+    """Yield host IPs in a CIDR (IPv4), excluding network/broadcast. Capped for safety."""
+    ip, _, pfx = cidr.partition("/")
+    pfx = int(pfx)
+    octets = [int(x) for x in ip.split(".")]
+    base = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+    size = 1 << (32 - pfx)
+    if size > cap:
+        return []
+    out = []
+    first, last = (base + 1, base + size - 1) if pfx < 31 else (base, base + size)
+    for v in range(first, last):
+        out.append("%d.%d.%d.%d" % ((v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255))
+    return out
+
+
+def tcp_open(ip, port, timeout=0.6):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def ping(ip, timeout=1):
+    code, _ = sh(["ping", "-c", "1", "-W", str(timeout), "-n", ip], timeout=timeout + 2)
+    return code == 0
+
+
+def reverse_dns(ip):
+    try:
+        socket.setdefaulttimeout(1.0)
+        return socket.gethostbyaddr(ip)[0]
+    except (OSError, socket.herror):
+        return None
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+# ---- minimal SNMPv2c GET (sysDescr, sysName, sysObjectID) ------------------------------------
+def _ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = []
+    while n:
+        b.insert(0, n & 0xFF)
+        n >>= 8
+    return bytes([0x80 | len(b)]) + bytes(b)
+
+
+def _ber_tlv(tag, val):
+    return bytes([tag]) + _ber_len(len(val)) + val
+
+
+def _ber_int(n):
+    if n == 0:
+        return _ber_tlv(0x02, b"\x00")
+    b = []
+    v = n
+    while v:
+        b.insert(0, v & 0xFF)
+        v >>= 8
+    if b[0] & 0x80:
+        b.insert(0, 0)
+    return _ber_tlv(0x02, bytes(b))
+
+
+def _ber_oid(oid):
+    parts = [int(x) for x in oid.split(".")]
+    body = [parts[0] * 40 + parts[1]]
+    for p in parts[2:]:
+        if p < 0x80:
+            body.append(p)
+        else:
+            chunk = []
+            while p:
+                chunk.insert(0, p & 0x7F)
+                p >>= 7
+            for i in range(len(chunk) - 1):
+                chunk[i] |= 0x80
+            body.extend(chunk)
+    return _ber_tlv(0x06, bytes(body))
+
+
+def snmp_get(ip, community, oids, timeout=1.2):
+    """Best-effort SNMPv2c GET. Returns {oid: value_str} for the ones that answer."""
+    try:
+        varbinds = b"".join(_ber_tlv(0x30, _ber_oid(o) + _ber_tlv(0x05, b"")) for o in oids)
+        vbl = _ber_tlv(0x30, varbinds)
+        pdu = _ber_tlv(0xA0, _ber_int(int(time.time()) & 0x7FFFFFFF) + _ber_int(0) + _ber_int(0) + vbl)
+        msg = _ber_tlv(0x30, _ber_int(1) + _ber_tlv(0x04, community.encode()) + pdu)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            s.sendto(msg, (ip, 161))
+            data, _ = s.recvfrom(4096)
+        finally:
+            s.close()
+        # crude varbind extraction: collect all printable OCTET STRING values in order
+        found = {}
+        vals = []
+        i = 0
+        while i < len(data) - 2:
+            if data[i] == 0x04:
+                ln = data[i + 1]
+                if ln < 0x80 and i + 2 + ln <= len(data):
+                    chunk = data[i + 2:i + 2 + ln]
+                    if all(32 <= c < 127 for c in chunk) and ln >= 1:
+                        vals.append(chunk.decode("ascii", "ignore"))
+                    i += 2 + ln
+                    continue
+            i += 1
+        # first octet string is the community echo; the rest line up with the requested OIDs
+        names = ["sysDescr", "sysName"]
+        for idx, name in enumerate(names):
+            if idx + 1 < len(vals):
+                found[name] = vals[idx + 1]
+        return found or None
+    except (OSError, socket.timeout, Exception):  # noqa
+        return None
+
+
+def a_net_scan(p, cfg):
+    # 1. subnets to scan
+    if p.get("targets"):
+        subnets = []
+        for part in re.split(r"[,\s]+", p["targets"].strip()):
+            if not part:
+                continue
+            net = cidr_network(part if "/" in part else part + "/24")
+            if net:
+                subnets.append({"cidr": net, "vlan": None, "iface": None})
+    else:
+        subnets = local_subnets()
+    if not subnets:
+        return 1, "Không phát hiện được subnet nào để quét", None
+    gateways = default_gateways()
+    gw_ips = set(gateways.values())
+    neigh = neighbor_table()
+    ports = DEEP_PORTS if p.get("deep") else DEFAULT_PORTS
+    if p.get("ports"):
+        try:
+            ports = sorted({int(x) for x in re.split(r"[,\s]+", p["ports"].strip()) if x})
+        except ValueError:
+            pass
+    community = p.get("snmp_community")
+
+    subnet_report, devices = [], []
+    scanner_ip = primary_ip()
+    for sn in subnets:
+        targets = hosts_in(sn["cidr"], cap=int(cfg.get("scan_host_cap", 1024)))
+        if not targets:
+            subnet_report.append({**sn, "hosts_scanned": 0, "note": "subnet quá lớn, bỏ qua (cần chỉ định targets)"})
+            continue
+        gw_ip = gateways.get(sn["iface"]) if sn["iface"] else None
+        # liveness: ping + arp prime, then TCP connect to find alive hosts
+        alive = {}
+
+        def probe(ip):
+            live = ip in neigh or ping(ip)
+            open_ports = []
+            for port in ports:
+                if tcp_open(ip, port):
+                    open_ports.append(port)
+                    live = True
+            return ip, (open_ports if live else None)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=int(cfg.get("scan_workers", 64))) as pool:
+            for ip, res in pool.map(probe, targets):
+                if res is not None:
+                    alive[ip] = res
+        # refresh neighbour cache after probing (ARP now populated)
+        neigh2 = neighbor_table()
+        for ip, open_ports in sorted(alive.items(), key=lambda kv: tuple(int(o) for o in kv[0].split("."))):
+            mac = neigh2.get(ip) or neigh.get(ip)
+            if ip == scanner_ip and not mac:
+                mac = None
+            vendor = mac_vendor(mac)
+            hostname = reverse_dns(ip)
+            is_gw = ip in gw_ips or ip == gw_ip
+            snmp = None
+            if community and 161 in open_ports:
+                snmp = snmp_get(ip, community, ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.5.0"])
+            devices.append({
+                "ip": ip, "mac": mac, "vendor": vendor, "hostname": hostname,
+                "subnet": sn["cidr"], "vlan": sn["vlan"],
+                "open_ports": [{"port": po, "proto": "tcp", "service": PORT_SERVICE.get(po)} for po in open_ports],
+                "device_type": guess_device_type(open_ports, vendor, hostname, is_gw),
+                "is_gateway": is_gw, "snmp": snmp,
+            })
+        subnet_report.append({"cidr": sn["cidr"], "vlan": sn["vlan"], "iface": sn["iface"],
+                              "gateway_ip": gw_ip, "hosts_scanned": len(targets), "devices_found": len(alive)})
+
+    result = {"subnets": subnet_report, "devices": devices,
+              "scanner": {"ip": scanner_ip, "hostname": socket.gethostname()}}
+    lines = ["Quét %d subnet, tìm thấy %d thiết bị:" % (len(subnet_report), len(devices))]
+    for sn in subnet_report:
+        lines.append("  %s%s — %d thiết bị" % (sn["cidr"], (" (VLAN %s)" % sn["vlan"]) if sn.get("vlan") else "", sn.get("devices_found", 0)))
+    for d in devices:
+        lines.append("  %-15s %-17s %-14s %s" % (d["ip"], d["mac"] or "-", d["device_type"], d["hostname"] or (d["vendor"] or "")))
+    return 0, "\n".join(lines), result
+
+
+def _ssh_exec(p, cfg, remote_cmd):
+    """Run a single command on a remote host over SSH, using a key or password from the vault.
+    Returns (exit_code, output)."""
+    host, user, port = p["host"], p.get("ssh_user", "root"), int(p.get("ssh_port", 22))
+    key, password = p.get("ssh_key"), p.get("ssh_password")
+    ssh_opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=12",
+                "-o", "NumberOfPasswordPrompts=1", "-p", str(port)]
+    keyfile = None
+    try:
+        if key:
+            keyfile = os.path.join(cfg.get("tmp_dir", "/tmp"), "infra_rk_%s" % stamp())
+            fdh = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fdh, "w") as f:
+                f.write(key if key.endswith("\n") else key + "\n")
+            args = ["ssh", "-i", keyfile, "-o", "BatchMode=yes"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]
+        elif password:
+            if not which("sshpass"):
+                return 1, "Thiếu 'sshpass' trên server quét để dùng mật khẩu SSH. Hãy dùng SSH key, hoặc cài sshpass."
+            args = ["sshpass", "-p", password, "ssh"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]
+        else:
+            args = ["ssh", "-o", "BatchMode=yes"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]
+        return sh(args, timeout=int(cfg.get("remote_install_timeout", 300)))
+    finally:
+        if keyfile:
+            try:
+                os.remove(keyfile)
+            except OSError:
+                pass
+
+
+def a_net_remote_install(p, cfg):
+    host, osname = p["host"], p.get("os", "linux")
+    server_url, token = p["server_url"], p["enroll_token"]
+    user = p.get("ssh_user", "root")
+    if osname == "windows":
+        remote = ("powershell -NoProfile -Command \"iwr %s/agent/install.ps1 -UseBasicParsing | iex; "
+                  "Install-InfraAgent -Server '%s' -Token '%s'\"") % (server_url, server_url, token)
+    else:
+        sudo = "" if user == "root" else "sudo -n "
+        remote = "curl -fsSL %s/agent/install.sh | %sbash -s -- --server %s --token %s" % (server_url, sudo, server_url, token)
+    code, out = _ssh_exec(p, cfg, remote)
+    return code, out, {"host": host, "os": osname, "installed": code == 0}
+
+
+def a_net_remote_uninstall(p, cfg):
+    host, osname = p["host"], p.get("os", "linux")
+    server_url, user = p["server_url"], p.get("ssh_user", "root")
+    if osname == "windows":
+        remote = ("powershell -NoProfile -Command \"iwr %s/agent/install.ps1 -UseBasicParsing | iex; "
+                  "Uninstall-InfraAgent%s\"") % (server_url, " -Purge" if p.get("purge") else "")
+    else:
+        sudo = "" if user == "root" else "sudo -n "
+        flag = " --purge" if p.get("purge") else " --uninstall"
+        remote = "curl -fsSL %s/agent/install.sh | %sbash -s --%s" % (server_url, sudo, flag)
+    code, out = _ssh_exec(p, cfg, remote)
+    return code, out, {"host": host, "os": osname, "uninstalled": code == 0}
+
+
 HANDLERS = {
     "system.info": lambda p, c: (lambda d: (0, json.dumps(d, indent=2), d))(dict(collect_facts(), **collect_metrics())),
     "system.disk_usage": lambda p, c: sh(["df", "-hT", "-x", "tmpfs", "-x", "devtmpfs", "-x", "overlay", "-x", "squashfs"]) + (None,),
@@ -625,6 +1055,9 @@ HANDLERS = {
     "db.mysql.status": a_mysql_status,
     "db.mysql.backup": a_mysql_backup,
     "db.backups.list": a_backups_list,
+    "net.scan": a_net_scan,
+    "net.remote_install": a_net_remote_install,
+    "net.remote_uninstall": a_net_remote_uninstall,
     "shell.exec": a_shell,
 }
 assert set(HANDLERS) == set(ACTIONS)

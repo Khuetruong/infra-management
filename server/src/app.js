@@ -44,6 +44,12 @@ function createApp(db) {
     allow_shell: !!s.allow_shell, status: s.status, last_seen_at: s.last_seen_at,
     metrics: parseJson(s.metrics), facts: parseJson(s.facts), created_at: s.created_at,
   });
+  const publicDevice = (d) => d && ({
+    id: d.id, org_id: d.org_id, scanner_server_id: d.scanner_server_id, ip: d.ip, mac: d.mac,
+    vendor: d.vendor, hostname: d.hostname, device_type: d.device_type, subnet: d.subnet, vlan: d.vlan,
+    open_ports: parseJson(d.open_ports, []), snmp: parseJson(d.snmp), is_gateway: !!d.is_gateway,
+    managed_server_id: d.managed_server_id, status: d.status, first_seen: d.first_seen, last_seen: d.last_seen,
+  });
   const publicTask = (t, { full = false } = {}) => t && ({
     id: t.id, server_id: t.server_id, action: t.action, title: ACTIONS[t.action]?.title, params: parseJson(t.params, {}),
     status: t.status, created_by: t.created_by, created_at: t.created_at, dispatched_at: t.dispatched_at,
@@ -393,6 +399,7 @@ function createApp(db) {
     const { action, params = {}, confirm = false } = ctx.body;
     const spec = ACTIONS[action];
     if (!spec) throw new HttpError(400, `Unknown action: ${action}`);
+    if (spec.internal) throw new HttpError(400, 'Thao tác này chỉ được tạo qua chức năng chuyên biệt');
     if (spec.platforms && !spec.platforms.includes(s.platform || 'linux')) throw new HttpError(400, `Thao tác này không hỗ trợ ${s.platform}`);
     if (!sec.hasRole(ctx.user, spec.minRole)) throw new HttpError(403, `Thao tác này cần vai trò ${spec.minRole}`);
     if (spec.destructive && confirm !== true) throw new HttpError(400, 'Thao tác nguy hiểm: cần xác nhận (confirm: true)');
@@ -425,6 +432,126 @@ function createApp(db) {
     if (!res.changes) throw new HttpError(409, 'Chỉ huỷ được lệnh đang chờ');
     await audit(ctx, 'task.cancelled', ctx.params.id);
     return { ok: true };
+  });
+
+  // ------------------------------------------------------------------ network scan & devices
+  async function assertSecret(name, orgId) {
+    if (!await one('SELECT id FROM secrets WHERE name = ? AND org_id = ?', name, orgId)) throw new HttpError(400, `Không tìm thấy secret: ${name}`);
+  }
+
+  // Trigger a network scan from an enrolled Linux agent.
+  r.post('/api/servers/:id/scan', requireUser('operator'), async (req, ctx) => {
+    const s = await getServer(ctx.params.id, ctx.orgId);
+    if (!s) throw new HttpError(404, 'Server not found');
+    if ((s.platform || 'linux') !== 'linux') throw new HttpError(400, 'Chỉ quét được từ agent Linux');
+    if (s.status === 'pending') throw new HttpError(409, 'Agent chưa kết nối');
+    const { targets = '', ports = '', deep = false, snmp_secret } = ctx.body;
+    const params = {};
+    if (targets) params.targets = targets;
+    if (ports) params.ports = ports;
+    if (deep) params.deep = true;
+    if (snmp_secret) { await assertSecret(snmp_secret, ctx.orgId); params.snmp_community = { $secret: snmp_secret }; }
+    let clean;
+    try { clean = validateParams('net.scan', params); } catch (e) { if (e instanceof ValidationError) throw new HttpError(400, e.message); throw e; }
+    const id = sec.newId('tsk');
+    await run('INSERT INTO tasks (id, org_id, server_id, action, params, status, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      id, ctx.orgId, s.id, 'net.scan', JSON.stringify(clean), 'queued', ctx.user.email, now());
+    await audit(ctx, 'task.created', id, { server: s.name, action: 'net.scan', params: { ...clean, snmp_community: snmp_secret ? '***' : undefined } });
+    return { task: publicTask(await one('SELECT * FROM tasks WHERE id = ?', id)) };
+  });
+
+  r.get('/api/devices', requireUser(), async (req, ctx) => {
+    const subnet = ctx.query.get('subnet');
+    const status = ctx.query.get('status');
+    const where = ['org_id = ?'];
+    const args = [ctx.orgId];
+    if (subnet) { where.push('subnet = ?'); args.push(subnet); }
+    if (status) { where.push('status = ?'); args.push(status); }
+    const rows = await all(`SELECT * FROM scanned_devices WHERE ${where.join(' AND ')} ORDER BY subnet, ip`, ...args);
+    return { devices: rows.map(publicDevice) };
+  });
+
+  // Network topology model: subnets (optionally grouped by VLAN) with the devices in each.
+  r.get('/api/topology', requireUser(), async (req, ctx) => {
+    const subnets = await all('SELECT * FROM network_subnets WHERE org_id = ? ORDER BY cidr', ctx.orgId);
+    const devices = (await all('SELECT * FROM scanned_devices WHERE org_id = ? ORDER BY ip', ctx.orgId)).map(publicDevice);
+    const bySubnet = {};
+    for (const d of devices) (bySubnet[d.subnet] = bySubnet[d.subnet] || []).push(d);
+    const nodes = subnets.map((sn) => ({
+      cidr: sn.cidr, vlan: sn.vlan, gateway_ip: sn.gateway_ip, scanner_server_id: sn.scanner_server_id,
+      device_count: sn.device_count, last_scan: sn.last_scan, devices: bySubnet[sn.cidr] || [],
+    }));
+    // group subnets by VLAN for multi-VLAN infrastructures
+    const vlans = {};
+    for (const n of nodes) { const k = n.vlan || '—'; (vlans[k] = vlans[k] || []).push(n.cidr); }
+    return { subnets: nodes, vlans, device_total: devices.length };
+  });
+
+  r.delete('/api/devices/:id', requireUser('operator'), async (req, ctx) => {
+    const res = await run('DELETE FROM scanned_devices WHERE id = ? AND org_id = ?', ctx.params.id, ctx.orgId);
+    if (!res.changes) throw new HttpError(404, 'Không tìm thấy thiết bị');
+    await audit(ctx, 'device.removed', ctx.params.id);
+    return { ok: true };
+  });
+
+  // Store a credential the admin typed inline as a short-lived vault secret, so it flows through
+  // the normal encrypt + redact pipeline. It is deleted automatically when the task finishes.
+  async function transientSecret(orgId, actor, value) {
+    const name = `__conn_${sec.randomToken('').replace(/[^A-Za-z0-9]/g, '').slice(0, 16)}`;
+    const enc = sec.encrypt(value);
+    await run('INSERT INTO secrets (id, org_id, name, description, ciphertext, iv, tag, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      sec.newId('sec'), orgId, name, 'thông tin đăng nhập tạm thời (tự xoá)', enc.ciphertext, enc.iv, enc.tag, actor, now(), now());
+    return name;
+  }
+
+  // Manage the agent on a discovered device over SSH from a scanner agent: install (and register
+  // the new server) or uninstall. Credentials are typed inline or taken from the vault.
+  r.post('/api/devices/:id/connect', requireUser('admin'), async (req, ctx) => {
+    const dev = await one('SELECT * FROM scanned_devices WHERE id = ? AND org_id = ?', ctx.params.id, ctx.orgId);
+    if (!dev) throw new HttpError(404, 'Không tìm thấy thiết bị');
+    if (!dev.ip) throw new HttpError(400, 'Thiết bị chưa có địa chỉ IP để kết nối');
+    const b = ctx.body;
+    const operation = b.operation === 'uninstall' ? 'uninstall' : 'install';
+    if (b.confirm !== true) throw new HttpError(400, 'Thao tác thay đổi thiết bị: cần xác nhận (confirm: true)');
+    const osName = b.os === 'windows' ? 'windows' : 'linux';
+    const scanner = b.scanner_server_id ? await getServer(b.scanner_server_id, ctx.orgId) : await one("SELECT * FROM servers WHERE org_id = ? AND status = 'online' AND platform = 'linux' ORDER BY last_seen_at DESC", ctx.orgId);
+    if (!scanner) throw new HttpError(400, 'Cần một agent Linux đang online để thực hiện từ xa');
+    if (scanner.status === 'pending') throw new HttpError(409, 'Agent quét chưa kết nối');
+
+    // resolve credentials: inline password/key -> transient secret; else named vault secret
+    let passRef = null;
+    let keyRef = null;
+    if (typeof b.ssh_password === 'string' && b.ssh_password) passRef = await transientSecret(ctx.orgId, ctx.user.email, b.ssh_password);
+    else if (b.ssh_password_secret) { await assertSecret(b.ssh_password_secret, ctx.orgId); passRef = b.ssh_password_secret; }
+    if (typeof b.ssh_key === 'string' && b.ssh_key) keyRef = await transientSecret(ctx.orgId, ctx.user.email, b.ssh_key);
+    else if (b.ssh_key_secret) { await assertSecret(b.ssh_key_secret, ctx.orgId); keyRef = b.ssh_key_secret; }
+
+    const base = { host: dev.ip, os: osName, ssh_user: b.ssh_user || 'root', ssh_port: Number(b.ssh_port) || 22, server_url: baseUrl(req) };
+    if (passRef) base.ssh_password = { $secret: passRef };
+    if (keyRef) base.ssh_key = { $secret: keyRef };
+
+    let action; let params;
+    if (operation === 'install') {
+      // mint a one-time enrollment token so the remote agent can enrol itself
+      const token = sec.randomToken('enr');
+      const srvName = String(b.name || dev.hostname || dev.ip);
+      const expires = new Date(Date.now() + config.ENROLL_TOKEN_TTL_SECONDS * 1000).toISOString();
+      await run('INSERT INTO enrollment_tokens (id, org_id, token_hash, name, tags, created_by, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)',
+        sec.newId('enr'), ctx.orgId, sec.sha256(token), srvName, JSON.stringify(['scanned', dev.subnet].filter(Boolean)), ctx.user.id, now(), expires);
+      action = 'net.remote_install';
+      params = { ...base, enroll_token: token };
+    } else {
+      action = 'net.remote_uninstall';
+      params = { ...base, purge: b.purge === true };
+    }
+    let clean;
+    try { clean = validateParams(action, params); } catch (e) { if (e instanceof ValidationError) throw new HttpError(400, e.message); throw e; }
+    const id = sec.newId('tsk');
+    await run('INSERT INTO tasks (id, org_id, server_id, action, params, status, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      id, ctx.orgId, scanner.id, action, JSON.stringify(clean), 'queued', ctx.user.email, now());
+    await run('UPDATE scanned_devices SET status = ? WHERE id = ?', operation === 'install' ? 'connecting' : 'discovered', dev.id);
+    await audit(ctx, operation === 'install' ? 'device.connect' : 'device.uninstall', dev.id, { host: dev.ip, scanner: scanner.name, os: osName });
+    return { task: publicTask(await one('SELECT * FROM tasks WHERE id = ?', id)), scanner_server_id: scanner.id };
   });
 
   // ------------------------------------------------------------------ secrets vault
@@ -494,6 +621,51 @@ function createApp(db) {
     if (wasOffline) await resolveAlert(`${server.id}:offline`);
   }
 
+  // Ingest a net.scan result: upsert discovered devices and subnets for the scanner's org,
+  // linking devices to already-managed servers by IP match.
+  async function ingestScan(server, result) {
+    if (!result || typeof result !== 'object') return;
+    const orgId = server.org_id;
+    const managed = await all('SELECT id, ip FROM servers WHERE org_id = ?', orgId);
+    const byIp = Object.fromEntries(managed.filter((s) => s.ip).map((s) => [s.ip, s.id]));
+    const devices = Array.isArray(result.devices) ? result.devices : [];
+    for (const d of devices) {
+      if (!d || typeof d !== 'object' || (!d.ip && !d.mac)) continue;
+      const dkey = (typeof d.mac === 'string' && d.mac) ? d.mac.toLowerCase() : `${d.subnet || ''}|${d.ip || ''}`;
+      const linkedServer = d.ip && byIp[d.ip] ? byIp[d.ip] : null;
+      const status = linkedServer ? 'managed' : 'discovered';
+      const ports = Array.isArray(d.open_ports) ? JSON.stringify(d.open_ports.slice(0, 64)) : '[]';
+      const snmp = d.snmp && typeof d.snmp === 'object' ? JSON.stringify(d.snmp) : null;
+      await run(
+        `INSERT INTO scanned_devices (id, org_id, dkey, scanner_server_id, ip, mac, vendor, hostname, device_type, subnet, vlan, open_ports, snmp, is_gateway, managed_server_id, status, first_seen, last_seen)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT (org_id, dkey) DO UPDATE SET
+           scanner_server_id = excluded.scanner_server_id, ip = excluded.ip, mac = COALESCE(excluded.mac, scanned_devices.mac),
+           vendor = COALESCE(excluded.vendor, scanned_devices.vendor), hostname = COALESCE(excluded.hostname, scanned_devices.hostname),
+           device_type = excluded.device_type, subnet = excluded.subnet, vlan = COALESCE(excluded.vlan, scanned_devices.vlan),
+           open_ports = excluded.open_ports, snmp = COALESCE(excluded.snmp, scanned_devices.snmp), is_gateway = excluded.is_gateway,
+           managed_server_id = COALESCE(excluded.managed_server_id, scanned_devices.managed_server_id),
+           status = CASE WHEN excluded.managed_server_id IS NOT NULL THEN 'managed'
+                         WHEN scanned_devices.status = 'connecting' THEN 'connecting' ELSE excluded.status END,
+           last_seen = excluded.last_seen`,
+        sec.newId('dev'), orgId, dkey, server.id, d.ip ?? null, d.mac ?? null, d.vendor ?? null, d.hostname ?? null,
+        d.device_type ?? null, d.subnet ?? null, d.vlan ?? null, ports, snmp, d.is_gateway ? 1 : 0, linkedServer, status, now(), now());
+    }
+    const subnets = Array.isArray(result.subnets) ? result.subnets : [];
+    for (const sn of subnets) {
+      if (!sn || !sn.cidr) continue;
+      const count = devices.filter((d) => d.subnet === sn.cidr).length;
+      await run(
+        `INSERT INTO network_subnets (id, org_id, cidr, vlan, gateway_ip, scanner_server_id, device_count, last_scan)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT (org_id, cidr) DO UPDATE SET vlan = COALESCE(excluded.vlan, network_subnets.vlan),
+           gateway_ip = COALESCE(excluded.gateway_ip, network_subnets.gateway_ip),
+           scanner_server_id = excluded.scanner_server_id, device_count = excluded.device_count, last_scan = excluded.last_scan`,
+        sec.newId('net'), orgId, sn.cidr, sn.vlan ?? null, sn.gateway_ip ?? null, server.id, count, now());
+    }
+    await audit({ orgId, server }, 'net.scan_ingested', server.id, { devices: devices.length, subnets: subnets.length });
+  }
+
   r.post('/api/agent/enroll', async (req, ctx) => {
     const { token } = ctx.body;
     const t = token && await one('SELECT * FROM enrollment_tokens WHERE token_hash = ?', sec.sha256(token));
@@ -545,6 +717,23 @@ function createApp(db) {
     await run('UPDATE tasks SET status = ?, exit_code = ?, output = ?, result = ?, finished_at = ? WHERE id = ?',
       status, Number.isInteger(exit_code) ? exit_code : null, out, res, now(), t.id);
     await audit(ctx, 'task.finished', t.id, { action: t.action, status, exit_code });
+    if (t.action === 'net.scan' && status === 'succeeded' && result) {
+      try { await ingestScan(ctx.server, result); } catch (e) { console.error('ingestScan failed', e); }
+    }
+    if ((t.action === 'net.remote_install' || t.action === 'net.remote_uninstall')) {
+      // delete any one-off credential secrets minted for this task
+      for (const v of Object.values(parseJson(t.params, {}))) {
+        if (v && typeof v === 'object' && typeof v.$secret === 'string' && v.$secret.startsWith('__conn_')) {
+          await run('DELETE FROM secrets WHERE name = ? AND org_id = ?', v.$secret, ctx.server.org_id).catch(() => {});
+        }
+      }
+      const host = result && result.host;
+      if (host && t.action === 'net.remote_install' && result.installed) {
+        await run("UPDATE scanned_devices SET status = 'managed' WHERE org_id = ? AND ip = ?", ctx.server.org_id, host);
+      } else if (host && t.action === 'net.remote_uninstall' && result.uninstalled) {
+        await run("UPDATE scanned_devices SET status = 'discovered', managed_server_id = NULL WHERE org_id = ? AND ip = ?", ctx.server.org_id, host);
+      }
+    }
     if (t.action === 'security.audit' && result && Array.isArray(result.findings)) {
       const high = result.findings.filter((f) => f.severity === 'high');
       const key = `${ctx.server.id}:audit`;

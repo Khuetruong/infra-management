@@ -4,18 +4,30 @@
 # Options: --ca-file PATH (custom CA for a self-signed control plane), --insecure-http (lab only).
 set -euo pipefail
 
-SERVER=""; TOKEN=""; EXTRA=()
+SERVER=""; TOKEN=""; EXTRA=(); UNINSTALL=0; PURGE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
     --ca-file) EXTRA+=(--ca-file "$2"); shift 2 ;;
     --insecure-http) EXTRA+=(--insecure-http); shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    --purge) UNINSTALL=1; PURGE=1; shift ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
-[ -n "$SERVER" ] && [ -n "$TOKEN" ] || { echo "Usage: install.sh --server URL --token TOKEN" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)." >&2; exit 1; }
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  systemctl disable --now infra-agent 2>/dev/null || true
+  rm -f /etc/systemd/system/infra-agent.service
+  systemctl daemon-reload 2>/dev/null || true
+  rm -rf /opt/infra-agent
+  if [ "$PURGE" -eq 1 ]; then rm -rf /etc/infra-agent /var/backups/infra-agent; echo "infra-agent gỡ hoàn toàn (kèm cấu hình)."; else echo "infra-agent đã gỡ. Cấu hình giữ ở /etc/infra-agent (dùng --purge để xoá hẳn)."; fi
+  exit 0
+fi
+
+[ -n "$SERVER" ] && [ -n "$TOKEN" ] || { echo "Usage: install.sh --server URL --token TOKEN   |   install.sh --uninstall [--purge]" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "systemd is required." >&2; exit 1; }
 

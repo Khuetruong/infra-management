@@ -64,7 +64,8 @@ const STATUS_LABEL = {
   failed: 'Thất bại', rejected: 'Agent từ chối', timeout: 'Quá thời gian', cancelled: 'Đã huỷ', open: 'Mới', acknowledged: 'Đã nhận', resolved: 'Đã xử lý',
   critical: 'Nghiêm trọng', warning: 'Cảnh báo', info: 'Thông tin', high: 'Cao', medium: 'Trung bình', low: 'Thấp',
 };
-const CATEGORY_LABEL = { system: 'Hệ thống', service: 'Dịch vụ & log', security: 'Bảo mật', database: 'Cơ sở dữ liệu', shell: 'Shell (break-glass)' };
+const CATEGORY_LABEL = { system: 'Hệ thống', service: 'Dịch vụ & log', security: 'Bảo mật', database: 'Cơ sở dữ liệu', network: 'Mạng & hạ tầng', shell: 'Shell (break-glass)' };
+const DEVICE_STATUS_LABEL = { discovered: 'Mới phát hiện', connecting: 'Đang kết nối', managed: 'Đã quản lý' };
 const badge = (status) => h('span', { class: `badge b-${status}` }, STATUS_LABEL[status] || status);
 
 function ago(iso) {
@@ -188,6 +189,7 @@ function authScreen({ setup, setupTokenRequired }) {
 const NAV = [
   { path: '/', label: 'Tổng quan' },
   { path: '/servers', label: 'Server' },
+  { path: '/network', label: 'Hạ tầng mạng' },
   { path: '/alerts', label: 'Cảnh báo', badge: true },
   { path: '/tasks', label: 'Lịch sử lệnh' },
   { path: '/secrets', label: 'Kho bí mật', role: 'operator' },
@@ -233,6 +235,7 @@ const ROUTES = [
   [/^\/$/, viewOverview],
   [/^\/servers$/, viewServers],
   [/^\/servers\/([^/]+)$/, viewServer],
+  [/^\/network$/, viewNetwork],
   [/^\/alerts$/, viewAlerts],
   [/^\/tasks$/, viewTasks],
   [/^\/secrets$/, viewSecrets],
@@ -539,6 +542,204 @@ async function viewServer(el, id) {
   el.querySelectorAll('.grid').forEach((g, i) => { if (i) g.style.marginTop = '16px'; });
   await loadTasks();
   every(5000, guard(loadTasks));
+}
+
+// ------------------------------------------------------------------ network scan & topology
+const portsLabel = (ports) => (ports || []).map((p) => (p.service ? `${p.port}/${p.service}` : String(p.port))).join(', ');
+
+function deviceTypeIcon(type) {
+  const t = (type || '').toLowerCase();
+  if (t.includes('gateway') || t.includes('router')) return '🌐';
+  if (t.includes('network')) return '🔀';
+  if (t.includes('printer')) return '🖨️';
+  if (t.includes('windows')) return '🪟';
+  if (t.includes('linux') || t.includes('unix')) return '🐧';
+  if (t.includes('virtual')) return '📦';
+  if (t.includes('raspberry')) return '🍓';
+  if (t.includes('apple') || t.includes('ios')) return '';
+  if (t.includes('web') || t.includes('appliance')) return '📟';
+  return '❔';
+}
+
+// Compact SVG diagram: gateway on the left, discovered devices fanned out and linked to it.
+function subnetDiagram(node) {
+  const devs = node.devices || [];
+  const shown = devs.slice(0, 40);
+  const cols = Math.max(1, Math.ceil(Math.sqrt(shown.length)));
+  const rows = Math.max(1, Math.ceil(shown.length / cols));
+  const W = 560, gx = 70, gy = 24 + (rows * 46) / 2, cellW = (W - 150) / cols, cellH = 46;
+  const H = Math.max(96, rows * cellH + 24);
+  const svg = s('svg', { class: 'topo', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet', role: 'img', 'aria-label': `Sơ đồ ${node.cidr}` });
+  shown.forEach((d, i) => {
+    const c = i % cols, rw = Math.floor(i / cols);
+    const x = 150 + c * cellW + cellW / 2, y = 24 + rw * cellH + cellH / 2;
+    svg.append(s('line', { x1: gx + 26, y1: gy, x2: x, y2: y, class: 'topo-link' }));
+  });
+  // gateway node
+  svg.append(s('rect', { x: gx - 26, y: gy - 16, width: 52, height: 32, rx: 6, class: 'topo-gw' }));
+  const gwt = s('text', { x: gx, y: gy + 5, 'text-anchor': 'middle', class: 'topo-gwt' });
+  gwt.append(document.createTextNode('GW'));
+  svg.append(gwt);
+  shown.forEach((d, i) => {
+    const c = i % cols, rw = Math.floor(i / cols);
+    const x = 150 + c * cellW + cellW / 2, y = 24 + rw * cellH + cellH / 2;
+    const g = s('g', { class: `topo-node s-${d.status}` });
+    g.append(s('circle', { cx: x, cy: y - 6, r: 9, class: d.is_gateway ? 'topo-dot gw' : 'topo-dot' }));
+    const label = s('text', { x, y: y + 12, 'text-anchor': 'middle', class: 'topo-label' });
+    label.append(document.createTextNode((d.ip || '').split('.').slice(-1)[0] || '?'));
+    const title = s('title', {});
+    title.append(document.createTextNode(`${d.ip || ''} ${d.hostname || d.vendor || ''} — ${d.device_type || ''}`));
+    g.append(title); g.append(label);
+    svg.append(g);
+  });
+  const more = devs.length - shown.length;
+  return h('div', {}, svg, more > 0 && h('div', { class: 'muted' }, `… và ${more} thiết bị khác`));
+}
+
+async function viewNetwork(el) {
+  const [{ servers }, secretsRes] = await Promise.all([
+    api('GET', '/api/servers'),
+    can('operator') ? api('GET', '/api/secrets') : Promise.resolve({ secrets: [] }),
+  ]);
+  const scanners = servers.filter((s2) => (s2.platform || 'linux') === 'linux' && s2.status !== 'pending');
+  const serverById = Object.fromEntries(servers.map((x) => [x.id, x]));
+  const box = h('div', {});
+
+  const deviceRow = (d) => h('tr', {},
+    h('td', {}, h('span', { class: `dot ${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'offline'}` }), h('strong', { class: 'mono' }, d.ip || '—')),
+    h('td', { class: 'mono' }, d.mac || '—'),
+    h('td', {}, d.vendor || (d.snmp?.sysName ? '' : '—')),
+    h('td', {}, d.hostname || d.snmp?.sysName || '—'),
+    h('td', {}, `${deviceTypeIcon(d.device_type)} ${d.device_type || '—'}`),
+    h('td', { class: 'mono small' }, portsLabel(d.open_ports) || '—'),
+    h('td', {}, h('span', { class: `badge b-${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'open'}` }, DEVICE_STATUS_LABEL[d.status] || d.status),
+      d.managed_server_id ? h('div', {}, h('a', { href: `#/servers/${d.managed_server_id}` }, 'mở server')) : null),
+    h('td', {}, h('div', { class: 'row' },
+      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => manageAgentDialog(d, scanners, secretsRes.secrets, guard(draw), 'install') }, 'Kết nối'),
+      can('admin') && d.status === 'managed' && h('button', { class: 'small', onclick: () => manageAgentDialog(d, scanners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
+      can('operator') && h('button', { class: 'small danger', onclick: guard(async () => { await api('DELETE', `/api/devices/${d.id}`); draw(); }) }, 'Xoá'))));
+
+  async function draw() {
+    const { subnets } = await api('GET', '/api/topology');
+    if (!subnets.length) {
+      fill(box, h('div', { class: 'panel empty' },
+        'Chưa có dữ liệu quét. Bấm "Quét mạng" và chọn một agent Linux đang online để quét toàn bộ thiết bị trong hạ tầng (IP, MAC, hãng, cổng mở, loại thiết bị). Nếu có nhiều VLAN, mỗi dải mạng sẽ được quét và vẽ sơ đồ riêng.'));
+      return;
+    }
+    // group subnets by VLAN
+    const groups = {};
+    for (const sn of subnets) (groups[sn.vlan || '—'] = groups[sn.vlan || '—'] || []).push(sn);
+    fill(box, Object.entries(groups).map(([vlan, nodes]) => h('div', { class: 'vlan-group' },
+      h('h2', {}, vlan === '—' ? 'Không gán VLAN' : `VLAN ${vlan}`),
+      nodes.map((node) => h('div', { class: 'panel subnet' },
+        h('div', { class: 'subnet-head' },
+          h('div', {}, h('strong', { class: 'mono' }, node.cidr),
+            h('span', { class: 'muted' }, ` · ${node.device_count} thiết bị`,
+              node.gateway_ip ? ` · gateway ${node.gateway_ip}` : '',
+              node.scanner_server_id ? ` · quét bởi ${serverById[node.scanner_server_id]?.name || 'agent'}` : '',
+              ` · ${ago(node.last_scan)}`))),
+        subnetDiagram(node),
+        node.devices.length ? h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, ['IP', 'MAC', 'Hãng', 'Hostname', 'Loại', 'Cổng mở', 'Trạng thái', ''].map((x) => h('th', {}, x)))),
+          h('tbody', {}, node.devices.map(deviceRow))))
+          : h('div', { class: 'empty' }, 'Không có thiết bị trong dải này'))))));
+  }
+
+  fill(el,
+    pageHead('Hạ tầng mạng',
+      can('operator') && h('button', { class: 'primary', onclick: () => scanDialog(scanners, secretsRes.secrets, guard(draw)) }, '🔍 Quét mạng')),
+    h('p', { class: 'muted' }, 'Từ một agent đã cài, nền tảng quét các dải mạng mà máy đó nhìn thấy, liệt kê mọi thiết bị kèm thông tin (IP, MAC/hãng, hostname, cổng & dịch vụ, loại thiết bị, SNMP nếu có), và dựng sơ đồ theo từng VLAN. Bấm "Kết nối" ở mỗi thiết bị để cài agent từ xa và đưa vào quản lý.'),
+    box);
+  await draw();
+  every(10000, guard(draw));
+}
+
+function scanDialog(scanners, secrets, onDone) {
+  if (!scanners.length) return void toast('Cần ít nhất một agent Linux đang online để quét', true);
+  const scanner = h('select', {}, scanners.map((x) => h('option', { value: x.id }, `${x.name} (${x.ip || x.hostname || x.id})`)));
+  const targets = h('input', { placeholder: 'để trống = tự dò các dải mạng; vd: 192.168.1.0/24, 10.0.0.0/24' });
+  const ports = h('input', { placeholder: 'để trống = bộ cổng phổ biến; vd: 22,80,443,3389' });
+  const deep = h('input', { type: 'checkbox' });
+  const snmp = h('select', {}, h('option', { value: '' }, '(không dùng SNMP)'), secrets.map((x) => h('option', { value: x.name }, x.name)));
+  const form = h('form', {
+    onsubmit: guard(async (e) => {
+      e.preventDefault();
+      const body = { targets: targets.value.trim(), ports: ports.value.trim(), deep: deep.checked };
+      if (snmp.value) body.snmp_secret = snmp.value;
+      const { task } = await api('POST', `/api/servers/${scanner.value}/scan`, body);
+      close();
+      toast('Đã gửi lệnh quét tới agent');
+      onDone();
+      showTask(task.id);
+    }),
+  },
+  h('label', {}, 'Agent quét (Linux, đang online)'), scanner,
+  h('label', {}, 'Dải mạng cần quét'), targets,
+  h('label', {}, 'Cổng cần kiểm tra'), ports,
+  h('label', { class: 'check' }, deep, 'Quét sâu (nhiều cổng hơn, chậm hơn)'),
+  h('label', {}, 'SNMP community (để lấy model/serial của thiết bị mạng)'), snmp,
+  h('p', { class: 'muted' }, 'Quét chạy công khai từ agent đã cài, ghi vào nhật ký audit. Dải mạng lớn hơn /22 cần chỉ định cụ thể trong ô "Dải mạng".'),
+  h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Bắt đầu quét')));
+  const close = modal('Quét hạ tầng mạng', form);
+}
+
+function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'install') {
+  if (!scanners.length) return void toast('Cần một agent Linux đang online để thực hiện từ xa', true);
+  const op = h('select', {},
+    h('option', { value: 'install', selected: defaultOp === 'install' }, 'Cài agent'),
+    h('option', { value: 'uninstall', selected: defaultOp === 'uninstall' }, 'Gỡ agent'));
+  const scanner = h('select', {}, scanners.map((x) => h('option', { value: x.id, selected: x.id === device.scanner_server_id }, `${x.name} (${x.ip || x.id})`)));
+  const os = h('select', {}, h('option', { value: 'linux', selected: !/windows/i.test(device.device_type || '') }, 'Linux (SSH)'), h('option', { value: 'windows', selected: /windows/i.test(device.device_type || '') }, 'Windows (SSH/OpenSSH)'));
+  const user = h('input', { value: 'root', placeholder: 'username', autocomplete: 'off' });
+  const pass = h('input', { type: 'password', placeholder: 'mật khẩu SSH', autocomplete: 'new-password' });
+  const port = h('input', { type: 'number', value: 22, min: 1, max: 65535 });
+  const name = h('input', { value: device.hostname || device.ip });
+  const purge = h('input', { type: 'checkbox' });
+  const pwSecret = h('select', {}, h('option', { value: '' }, '(dùng mật khẩu nhập ở trên)'), secrets.map((x) => h('option', { value: x.name }, x.name)));
+  const keySecret = h('select', {}, h('option', { value: '' }, '(không dùng SSH key)'), secrets.map((x) => h('option', { value: x.name }, x.name)));
+  const installOnly = h('div', {}, h('label', {}, 'Tên server khi thêm vào'), name);
+  const uninstallOnly = h('label', { class: 'check', hidden: true }, purge, 'Xoá luôn cấu hình trên máy (--purge)');
+  const submitBtn = h('button', { class: 'primary', type: 'submit' }, 'Cài & đưa vào quản lý');
+  const syncOp = () => {
+    const uninstall = op.value === 'uninstall';
+    installOnly.hidden = uninstall;
+    uninstallOnly.hidden = !uninstall;
+    submitBtn.textContent = uninstall ? 'Gỡ agent khỏi máy' : 'Cài & đưa vào quản lý';
+  };
+  op.addEventListener('change', syncOp);
+  const form = h('form', {
+    onsubmit: guard(async (e) => {
+      e.preventDefault();
+      const uninstall = op.value === 'uninstall';
+      const body = { operation: op.value, scanner_server_id: scanner.value, os: os.value, ssh_user: user.value.trim() || 'root', ssh_port: Number(port.value) || 22, confirm: true };
+      if (!uninstall) body.name = name.value.trim();
+      if (uninstall) body.purge = purge.checked;
+      if (pwSecret.value) body.ssh_password_secret = pwSecret.value;
+      else if (pass.value) body.ssh_password = pass.value;      // typed inline → stored as a one-off secret, auto-deleted
+      if (keySecret.value) body.ssh_key_secret = keySecret.value;
+      const { task } = await api('POST', `/api/devices/${device.id}/connect`, body);
+      close();
+      toast(uninstall ? 'Đang gỡ agent từ xa…' : 'Đang cài agent từ xa…');
+      onDone();
+      showTask(task.id);
+    }),
+  },
+  h('p', {}, 'Thiết bị ', h('strong', { class: 'mono' }, device.ip), device.hostname ? ` (${device.hostname})` : '', '. Thao tác chạy từ agent quét qua SSH và được ghi vào nhật ký audit.'),
+  h('label', {}, 'Thao tác'), op,
+  h('label', {}, 'Agent thực hiện (Linux, online)'), scanner,
+  h('label', {}, 'Hệ điều hành thiết bị'), os,
+  h('div', { class: 'grid two' },
+    h('div', {}, h('label', {}, 'Tài khoản SSH (username)'), user),
+    h('div', {}, h('label', {}, 'Cổng SSH'), port)),
+  h('label', {}, 'Mật khẩu SSH'), pass,
+  h('details', {}, h('summary', { class: 'muted' }, 'Hoặc dùng thông tin từ kho bí mật / SSH key'),
+    h('label', {}, 'Mật khẩu từ kho bí mật'), pwSecret,
+    h('label', {}, 'SSH private key từ kho bí mật'), keySecret),
+  installOnly, uninstallOnly,
+  h('p', { class: 'muted' }, 'Nhập username + mật khẩu rồi bấm nút bên dưới để tự động đẩy cài/gỡ. Mật khẩu nhập trực tiếp được mã hoá, dùng một lần rồi tự xoá. Dùng mật khẩu cần có "sshpass" trên máy quét (hoặc dùng SSH key).'),
+  h('div', { class: 'actions' }, submitBtn));
+  const close = modal('Quản lý agent trên thiết bị', form);
+  syncOp();
 }
 
 async function viewAlerts(el) {

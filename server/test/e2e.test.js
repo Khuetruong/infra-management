@@ -200,6 +200,96 @@ test('multi-tenant: organizations are isolated', async () => {
   assert.equal(bUsers[0].email, 'b-owner@example.com');
 });
 
+test('network scan: ingest devices, topology, remote install + uninstall, transient secret cleanup', async () => {
+  const owner = (await api('POST', '/api/auth/login', { email: 'owner@example.com', password: 'correct horse battery' })).body.token;
+
+  // enrol a scanner agent directly over the agent protocol (no real network scan is run)
+  const enr = await api('POST', '/api/enrollment-tokens', { name: 'scanner-1' }, owner);
+  const enrolled = await api('POST', '/api/agent/enroll', { token: enr.body.token, platform: 'linux', facts: { hostname: 'scanner', primary_ip: '10.9.0.5' }, metrics: { cpu_percent: 1 } });
+  assert.equal(enrolled.status, 200);
+  const agentToken = enrolled.body.agent_token;
+  const scannerId = enrolled.body.server_id;
+
+  const asAgent = (method, url, body) => api(method, url, body, agentToken);
+  const runNextTask = async (resultBody) => {
+    const hb = await asAgent('POST', '/api/agent/heartbeat', {});
+    const task = hb.body.tasks[0];
+    assert.ok(task, 'a task should be dispatched to the agent');
+    const r = await asAgent('POST', `/api/agent/tasks/${task.id}/result`, resultBody);
+    assert.equal(r.status, 200);
+    return task;
+  };
+
+  // trigger a scan, then feed a crafted result back as the agent
+  const scan = await api('POST', `/api/servers/${scannerId}/scan`, { targets: '10.9.0.0/24' }, owner);
+  assert.equal(scan.status, 200);
+  assert.equal(scan.body.task.action, 'net.scan');
+  const scanTask = await runNextTask({
+    status: 'succeeded', exit_code: 0,
+    result: {
+      subnets: [{ cidr: '10.9.0.0/24', vlan: '10', gateway_ip: '10.9.0.1' }],
+      devices: [
+        { ip: '10.9.0.5', mac: 'aa:bb:cc:00:00:05', vendor: 'VMware', hostname: 'scanner', device_type: 'Linux/Unix host', subnet: '10.9.0.0/24', vlan: '10', open_ports: [{ port: 22, proto: 'tcp', service: 'ssh' }], is_gateway: false },
+        { ip: '10.9.0.20', mac: 'de:ad:be:ef:00:20', vendor: 'Dell', hostname: 'db-01', device_type: 'Windows host', subnet: '10.9.0.0/24', vlan: '10', open_ports: [{ port: 3389, proto: 'tcp', service: 'rdp' }], is_gateway: false },
+        { ip: '10.9.0.1', mac: '00:00:0c:aa:bb:cc', vendor: 'Cisco', device_type: 'gateway/router', subnet: '10.9.0.0/24', vlan: '10', open_ports: [{ port: 161, proto: 'tcp', service: 'snmp' }], is_gateway: true },
+      ],
+      scanner: { ip: '10.9.0.5', hostname: 'scanner' },
+    },
+  });
+  assert.equal(scanTask.action, 'net.scan');
+
+  // devices appear, and the scanner's own IP is linked to its managed server
+  const devices = (await api('GET', '/api/devices', null, owner)).body.devices;
+  assert.equal(devices.length, 3);
+  const self = devices.find((d) => d.ip === '10.9.0.5');
+  assert.equal(self.managed_server_id, scannerId);
+  assert.equal(self.status, 'managed');
+  const dbDev = devices.find((d) => d.ip === '10.9.0.20');
+  assert.equal(dbDev.status, 'discovered');
+  assert.equal(dbDev.vendor, 'Dell');
+
+  // topology groups by VLAN and counts devices
+  const topo = (await api('GET', '/api/topology', null, owner)).body;
+  assert.equal(topo.device_total, 3);
+  assert.equal(topo.subnets[0].cidr, '10.9.0.0/24');
+  assert.equal(topo.subnets[0].device_count, 3);
+  assert.deepEqual(topo.vlans['10'], ['10.9.0.0/24']);
+
+  // another org sees none of these devices
+  const bOwner = (await api('POST', '/api/auth/login', { email: 'b-owner@example.com', password: 'company b password' })).body.token;
+  assert.equal((await api('GET', '/api/devices', null, bOwner)).body.devices.length, 0);
+
+  // connect: install an agent on the discovered device, with an inline SSH password
+  const conn = await api('POST', `/api/devices/${dbDev.id}/connect`, { operation: 'install', scanner_server_id: scannerId, os: 'linux', ssh_user: 'root', ssh_password: 'remote-ssh-pw', confirm: true }, owner);
+  assert.equal(conn.status, 200);
+  assert.equal(conn.body.task.action, 'net.remote_install');
+  // a one-off credential secret was created
+  let secrets = (await api('GET', '/api/secrets', null, owner)).body.secrets;
+  assert.ok(secrets.some((s) => s.name.startsWith('__conn_')), 'transient secret created');
+  assert.equal((await api('GET', '/api/devices?status=connecting', null, owner)).body.devices.length, 1);
+
+  // the agent picks it up (password resolved in-band) and reports success → transient secret deleted
+  const instTask = await runNextTask({ status: 'succeeded', exit_code: 0, result: { host: '10.9.0.20', os: 'linux', installed: true } });
+  assert.equal(instTask.action, 'net.remote_install');
+  assert.equal(instTask.params.ssh_password, 'remote-ssh-pw', 'agent received the decrypted password');
+  secrets = (await api('GET', '/api/secrets', null, owner)).body.secrets;
+  assert.equal(secrets.some((s) => s.name.startsWith('__conn_')), false, 'transient secret cleaned up');
+  assert.equal((await api('GET', '/api/devices', null, owner)).body.devices.find((d) => d.ip === '10.9.0.20').status, 'managed');
+
+  // output must not leak the password
+  const instResult = (await api('GET', `/api/tasks/${instTask.id}`, null, owner)).body.task;
+  assert.equal(JSON.stringify(instResult).includes('remote-ssh-pw'), false);
+
+  // uninstall path flips the device back to discovered
+  const un = await api('POST', `/api/devices/${dbDev.id}/connect`, { operation: 'uninstall', scanner_server_id: scannerId, os: 'linux', ssh_user: 'root', ssh_password: 'remote-ssh-pw', purge: true, confirm: true }, owner);
+  assert.equal(un.body.task.action, 'net.remote_uninstall');
+  await runNextTask({ status: 'succeeded', exit_code: 0, result: { host: '10.9.0.20', os: 'linux', uninstalled: true } });
+  assert.equal((await api('GET', '/api/devices', null, owner)).body.devices.find((d) => d.ip === '10.9.0.20').status, 'discovered');
+
+  // internal actions cannot be created through the generic task endpoint
+  assert.equal((await api('POST', `/api/servers/${scannerId}/tasks`, { action: 'net.remote_install', params: {} }, owner)).status, 400);
+});
+
 test('static: web UI and agent files are served, traversal blocked', async () => {
   const index = await fetch(base + '/');
   assert.equal(index.status, 200);

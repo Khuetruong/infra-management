@@ -131,3 +131,19 @@ form .actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex
 .org-switch select { width: 100%; }
 .org-name { padding: 4px 10px 12px; font-weight: 600; color: var(--muted); font-size: 12.5px; }
 @media (max-width: 860px) { .org-switch, .org-name { order: 3; flex-basis: 100%; } }
+
+/* network scan & topology */
+.vlan-group { margin-bottom: 18px; }
+.vlan-group > h2 { margin: 6px 2px 10px; }
+.panel.subnet { margin-bottom: 14px; }
+.subnet-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.small.mono, td.small { font-size: 12px; }
+svg.topo { width: 100%; height: auto; max-height: 260px; display: block; margin: 4px 0 10px; }
+.topo-link { stroke: var(--border); stroke-width: 1; }
+.topo-gw { fill: var(--accent); opacity: .9; }
+.topo-gwt { fill: #fff; font-size: 12px; font-weight: 700; }
+.topo-dot { fill: var(--muted); stroke: var(--panel); stroke-width: 2; }
+.topo-dot.gw { fill: var(--accent); }
+.topo-node.s-managed .topo-dot { fill: var(--ok); }
+.topo-node.s-connecting .topo-dot { fill: var(--warn); }
+.topo-label { fill: var(--muted); font-size: 10px; }

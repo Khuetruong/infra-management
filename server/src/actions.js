@@ -43,6 +43,34 @@ const ACTIONS = {
   'db.mysql.backup':      { category: 'database', title: 'MySQL/MariaDB: backup (mysqldump)', minRole: 'operator', params: { database: { type: 'string', pattern: DBNAME, required: true }, user: { type: 'string', pattern: NAME, default: 'root' }, password: { type: 'secret' } } },
   'db.backups.list':      { category: 'database', title: 'Danh sách file backup trên server', minRole: 'viewer', params: {} },
 
+  // ---- network discovery & remote onboarding (agent must run on Linux) ----
+  'net.scan':             { category: 'network',  title: 'Quét hạ tầng mạng', minRole: 'operator', platforms: ['linux'], params: {
+    targets: { type: 'string', pattern: '[0-9A-Fa-f:.,/ ]{0,512}' },
+    ports: { type: 'string', pattern: '[0-9, ]{0,256}' },
+    deep: { type: 'bool', default: false },
+    snmp_community: { type: 'secret' },
+  } },
+  'net.remote_install':   { category: 'network',  title: 'Cài agent từ xa tới thiết bị', minRole: 'admin', destructive: true, platforms: ['linux'], internal: true, params: {
+    host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
+    os: { type: 'enum', values: ['linux', 'windows'], default: 'linux' },
+    ssh_user: { type: 'string', pattern: NAME, default: 'root' },
+    ssh_port: { type: 'int', min: 1, max: 65535, default: 22 },
+    server_url: { type: 'string', pattern: 'https?://[^\\s]{3,256}', required: true },
+    enroll_token: { type: 'string', pattern: '[A-Za-z0-9_-]{8,160}', required: true },
+    ssh_password: { type: 'secret' },
+    ssh_key: { type: 'secret' },
+  } },
+  'net.remote_uninstall': { category: 'network',  title: 'Gỡ agent từ xa khỏi thiết bị', minRole: 'admin', destructive: true, platforms: ['linux'], internal: true, params: {
+    host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
+    os: { type: 'enum', values: ['linux', 'windows'], default: 'linux' },
+    ssh_user: { type: 'string', pattern: NAME, default: 'root' },
+    ssh_port: { type: 'int', min: 1, max: 65535, default: 22 },
+    server_url: { type: 'string', pattern: 'https?://[^\\s]{3,256}', required: true },
+    purge: { type: 'bool', default: false },
+    ssh_password: { type: 'secret' },
+    ssh_key: { type: 'secret' },
+  } },
+
   // ---- break-glass ----
   'shell.exec':           { category: 'shell',    title: 'Chạy lệnh shell (break-glass)', minRole: 'admin', destructive: true, requiresShell: true, params: { command: { type: 'string', required: true, maxLength: 4000 } } },
 };

@@ -133,6 +133,40 @@ const TABLES = (pg) => `
     count INTEGER NOT NULL,
     first_at TEXT NOT NULL
   );
+
+  -- Network scan: devices discovered on the infrastructure by an enrolled agent.
+  CREATE TABLE IF NOT EXISTS scanned_devices (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    dkey TEXT NOT NULL,                 -- dedupe key within org: mac, else subnet|ip
+    scanner_server_id TEXT,            -- the agent that observed it
+    ip TEXT,
+    mac TEXT,
+    vendor TEXT,
+    hostname TEXT,
+    device_type TEXT,
+    subnet TEXT,                       -- CIDR the device sits in
+    vlan TEXT,                         -- VLAN id/name when detectable
+    open_ports TEXT NOT NULL DEFAULT '[]',
+    snmp TEXT,                         -- JSON: sysName, sysDescr, model, serial, ...
+    is_gateway INTEGER NOT NULL DEFAULT 0,
+    managed_server_id TEXT,            -- linked server once an agent is installed
+    status TEXT NOT NULL DEFAULT 'discovered',  -- discovered | connecting | managed
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+  );
+
+  -- Network scan: subnets / VLANs discovered, for the topology model.
+  CREATE TABLE IF NOT EXISTS network_subnets (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    cidr TEXT NOT NULL,
+    vlan TEXT,
+    gateway_ip TEXT,
+    scanner_server_id TEXT,
+    device_count INTEGER NOT NULL DEFAULT 0,
+    last_scan TEXT NOT NULL
+  );
 `;
 
 // Column additions applied to databases created by an older schema version.
@@ -187,6 +221,9 @@ async function migrate(d, pg) {
   await d.run('CREATE INDEX IF NOT EXISTS servers_org ON servers(org_id)').catch(() => {});
   await d.run('CREATE INDEX IF NOT EXISTS alerts_status ON alerts(org_id, status)').catch(() => {});
   await d.run('CREATE UNIQUE INDEX IF NOT EXISTS secrets_org_name ON secrets(org_id, name)').catch(() => {});
+  await d.run('CREATE UNIQUE INDEX IF NOT EXISTS scanned_devices_org_dkey ON scanned_devices(org_id, dkey)').catch(() => {});
+  await d.run('CREATE INDEX IF NOT EXISTS scanned_devices_org ON scanned_devices(org_id)').catch(() => {});
+  await d.run('CREATE UNIQUE INDEX IF NOT EXISTS network_subnets_org_cidr ON network_subnets(org_id, cidr)').catch(() => {});
 }
 
 function sqliteDriver(file) {
