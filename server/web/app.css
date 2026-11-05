@@ -124,3 +124,10 @@ form .actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex
   .two { grid-template-columns: 1fr; }
 }
 [hidden] { display: none !important; }
+
+/* org switcher */
+.org-switch { padding: 6px 8px 12px; }
+.org-switch label { margin: 0 0 4px; }
+.org-switch select { width: 100%; }
+.org-name { padding: 4px 10px 12px; font-weight: 600; color: var(--muted); font-size: 12.5px; }
+@media (max-width: 860px) { .org-switch, .org-name { order: 3; flex-basis: 100%; } }

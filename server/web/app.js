@@ -41,7 +41,12 @@ function toast(msg, isError = false) {
 async function api(method, url, body) {
   const res = await fetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json', ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}),
+      // platform admins can act within a selected organization
+      ...(state.orgId && state.user?.platform_admin && state.orgId !== state.user.org_id ? { 'X-Org-Id': state.orgId } : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -143,6 +148,7 @@ function setSession(token, user) {
 function authScreen({ setup, setupTokenRequired }) {
   const err = h('div', { class: 'err', role: 'alert' });
   const fields = {
+    org_name: h('input', {}),
     name: h('input', { autocomplete: 'name' }),
     email: h('input', { type: 'email', required: true, autocomplete: 'username' }),
     password: h('input', { type: 'password', required: true, minlength: setup ? 10 : null, autocomplete: setup ? 'new-password' : 'current-password' }),
@@ -156,7 +162,7 @@ function authScreen({ setup, setupTokenRequired }) {
       submit.disabled = true;
       try {
         const body = { email: fields.email.value, password: fields.password.value,
-          ...(setup ? { name: fields.name.value } : {}),
+          ...(setup ? { name: fields.name.value, org_name: fields.org_name.value } : {}),
           ...(setup && setupTokenRequired ? { setup_token: fields.setup_token.value } : {}) };
         const res = await api('POST', setup ? '/api/setup' : '/api/auth/login', body);
         setSession(res.token, res.user);
@@ -164,7 +170,7 @@ function authScreen({ setup, setupTokenRequired }) {
       } catch (ex) { err.textContent = ex.message; } finally { submit.disabled = false; }
     },
   },
-  setup && [h('p', { class: 'muted' }, 'Lần đầu khởi chạy: tạo tài khoản chủ sở hữu (owner) cho nền tảng.'), h('label', {}, 'Họ tên'), fields.name],
+  setup && [h('p', { class: 'muted' }, 'Lần đầu khởi chạy: tạo công ty và tài khoản chủ sở hữu (owner) đầu tiên.'), h('label', {}, 'Tên công ty của bạn'), fields.org_name, h('label', {}, 'Họ tên'), fields.name],
   h('label', {}, 'Email'), fields.email,
   h('label', {}, 'Mật khẩu'), fields.password,
   setup && h('div', { class: 'muted' }, 'Tối thiểu 10 ký tự.'),
@@ -186,9 +192,22 @@ const NAV = [
   { path: '/tasks', label: 'Lịch sử lệnh' },
   { path: '/secrets', label: 'Kho bí mật', role: 'operator' },
   { path: '/users', label: 'Người dùng', role: 'admin' },
+  { path: '/orgs', label: 'Công ty', platformAdmin: true },
   { path: '/audit', label: 'Nhật ký audit', role: 'admin' },
   { path: '/account', label: 'Tài khoản' },
 ];
+
+function orgSwitcher() {
+  if (!state.user.platform_admin || !state.orgs || state.orgs.length < 2) {
+    return h('div', { class: 'org-name' }, state.orgs ? '' : '', (state.orgs || []).find((o) => o.id === state.orgId)?.name || state.org?.name || '');
+  }
+  const sel = h('select', { 'aria-label': 'Chọn công ty', onchange: () => {
+    state.orgId = sel.value;
+    try { localStorage.setItem('orgId', sel.value); } catch { /* ignore */ }
+    route();
+  } }, state.orgs.map((o) => h('option', { value: o.id, selected: o.id === state.orgId }, o.name + (o.disabled ? ' (tắt)' : ''))));
+  return h('div', { class: 'org-switch' }, h('label', {}, 'Công ty'), sel);
+}
 
 function shell(content) {
   const path = location.hash.slice(1) || '/';
@@ -197,15 +216,16 @@ function shell(content) {
     const n = r.alerts.filter((a) => a.status === 'open').length;
     if (n) { alertCount.textContent = n; alertCount.hidden = false; }
   }).catch(() => {});
-  const nav = h('nav', { class: 'nav' }, NAV.filter((n) => !n.role || can(n.role)).map((n) => {
+  const nav = h('nav', { class: 'nav' }, NAV.filter((n) => (!n.role || can(n.role)) && (!n.platformAdmin || state.user.platform_admin)).map((n) => {
     const active = n.path === '/' ? path === '/' : path.startsWith(n.path);
     return h('a', { href: `#${n.path}`, class: active ? 'active' : null }, n.label, n.badge && alertCount);
   }));
   fill($app, h('div', { class: 'shell' },
     h('aside', { class: 'side' },
       h('div', { class: 'brand' }, h('img', { src: '/favicon.svg', alt: '' }), 'Infra Control'),
+      orgSwitcher(),
       nav,
-      h('div', { class: 'who' }, h('div', {}, state.user.name), h('div', {}, state.user.email), h('div', {}, ROLE_LABEL[state.user.role]))),
+      h('div', { class: 'who' }, h('div', {}, state.user.name), h('div', {}, state.user.email), h('div', {}, ROLE_LABEL[state.user.role], state.user.platform_admin ? ' · Quản trị nền tảng' : ''))),
     h('main', { class: 'main' }, content)));
 }
 
@@ -217,6 +237,7 @@ const ROUTES = [
   [/^\/tasks$/, viewTasks],
   [/^\/secrets$/, viewSecrets],
   [/^\/users$/, viewUsers],
+  [/^\/orgs$/, viewOrgs],
   [/^\/audit$/, viewAudit],
   [/^\/account$/, viewAccount],
 ];
@@ -242,7 +263,14 @@ async function boot() {
     return;
   }
   try {
-    state.user = (await api('GET', '/api/auth/me')).user;
+    const me = await api('GET', '/api/auth/me');
+    state.user = me.user;
+    state.org = me.org;
+    state.orgs = me.organizations || null;
+    // restore a previously selected org (platform admin), else default to own org
+    let saved = null;
+    try { saved = localStorage.getItem('orgId'); } catch { /* ignore */ }
+    state.orgId = (me.user.platform_admin && saved && (me.organizations || []).some((o) => o.id === saved)) ? saved : me.user.org_id;
   } catch {
     state.token = null;
     return boot();
@@ -336,11 +364,14 @@ function addServerDialog(onDone) {
       e.preventDefault();
       const res = await api('POST', '/api/enrollment-tokens', { name: name.value.trim(), tags: tags.value.split(',').map((t) => t.trim()).filter(Boolean) });
       const insecure = res.install_command.includes('--server http://');
-      fill(body, 
-        h('p', {}, 'Chạy lệnh sau trên server cần quản lý (cần quyền root, Linux có systemd và python3). Token chỉ dùng được một lần và hết hạn lúc ', h('strong', {}, fmtTime(res.expires_at)), '.'),
+      fill(body,
+        h('p', {}, 'Token chỉ dùng được một lần, hết hạn lúc ', h('strong', {}, fmtTime(res.expires_at)), '. Chọn hệ điều hành của server:'),
+        h('h3', { style: null }, 'Linux (cần root, systemd, python3)'),
         copyBox(res.install_command + (insecure ? ' --insecure-http' : '')),
+        h('h3', { style: null }, 'Windows (PowerShell quyền Administrator)'),
+        copyBox(res.install_command_windows || ''),
         insecure && h('p', { class: 'err' }, 'Nền tảng đang chạy bằng HTTP. Chỉ dùng cho môi trường thử nghiệm; khi chạy thật hãy đặt HTTPS (TLS_CERT/TLS_KEY hoặc reverse proxy) và PUBLIC_URL.'),
-        h('p', { class: 'muted' }, 'Agent chỉ kết nối ra ngoài tới nền tảng, không mở cổng nào trên server. Shell tự do bị tắt mặc định.'),
+        h('p', { class: 'muted' }, 'Agent chỉ kết nối ra ngoài tới nền tảng, không mở cổng nào trên máy. Cài như một dịch vụ có tên rõ ràng (systemd / Windows Service). Shell tự do bị tắt mặc định.'),
         h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => { close(); onDone(); } }, 'Xong')));
     }),
   }, h('label', {}, 'Tên server'), name, h('label', {}, 'Nhãn'), tags,
@@ -638,6 +669,75 @@ function userDialog(roles, onDone) {
   }, h('label', {}, 'Họ tên'), f.name, h('label', {}, 'Email'), f.email, h('label', {}, 'Mật khẩu tạm'), f.password, h('label', {}, 'Vai trò'), f.role,
   h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Tạo')));
   const close = modal('Thêm người dùng', form);
+}
+
+// ------------------------------------------------------------------ organizations (platform admin)
+async function viewOrgs(el) {
+  const draw = async () => {
+    const { organizations } = await api('GET', '/api/orgs');
+    fill(el,
+      pageHead('Công ty', h('button', { class: 'primary', onclick: () => orgDialog(draw) }, '+ Thêm công ty')),
+      h('div', { class: 'panel' },
+        h('p', { class: 'muted' }, 'Mỗi công ty là một hạ tầng riêng biệt: người dùng, server, bí mật và cảnh báo của công ty nào chỉ công ty đó thấy. Dùng ô chọn công ty ở góc trái để xem và quản lý từng công ty.'),
+        h('div', { class: 'table-wrap' }, h('table', {},
+          h('thead', {}, h('tr', {}, ['Công ty', 'Server', 'Người dùng', 'Trạng thái', 'Tạo lúc', ''].map((x) => h('th', {}, x))),
+          ), h('tbody', {}, organizations.map((o) => h('tr', {},
+            h('td', {}, h('strong', {}, o.name), o.id === state.user.org_id ? h('span', { class: 'muted' }, ' (công ty gốc)') : null),
+            h('td', {}, String(o.servers)),
+            h('td', {}, String(o.users)),
+            h('td', {}, o.disabled ? badge('offline') : badge('online')),
+            h('td', {}, fmtTime(o.created_at)),
+            h('td', {}, h('div', { class: 'row' },
+              h('button', { class: 'small', onclick: () => { state.orgId = o.id; try { localStorage.setItem('orgId', o.id); } catch { /* ignore */ } location.hash = '#/servers'; } }, 'Mở'),
+              h('button', { class: 'small', onclick: guard(async () => {
+                const name = prompt('Tên mới', o.name);
+                if (!name) return;
+                await api('PATCH', `/api/orgs/${o.id}`, { name });
+                state.orgs = (await api('GET', '/api/auth/me')).organizations;
+                draw();
+              }) }, 'Đổi tên'),
+              o.id !== state.user.org_id && h('button', { class: 'small', onclick: guard(async () => {
+                await api('PATCH', `/api/orgs/${o.id}`, { disabled: !o.disabled });
+                draw();
+              }) }, o.disabled ? 'Bật' : 'Tắt'))))))))));
+    el.querySelectorAll('tbody td:nth-child(4) .badge').forEach((b) => { b.textContent = b.classList.contains('b-online') ? 'Hoạt động' : 'Đã tắt'; });
+  };
+  await draw();
+}
+
+function orgDialog(onDone) {
+  const f = {
+    name: h('input', { required: true, placeholder: 'Tên công ty' }),
+    admin_email: h('input', { type: 'email', placeholder: 'tùy chọn' }),
+    admin_name: h('input', {}),
+    admin_password: h('input', { type: 'password', minlength: 10, autocomplete: 'new-password' }),
+  };
+  const form = h('form', {
+    onsubmit: guard(async (e) => {
+      e.preventDefault();
+      const body = { name: f.name.value.trim() };
+      if (f.admin_email.value.trim()) {
+        body.admin_email = f.admin_email.value.trim();
+        body.admin_name = f.admin_name.value.trim();
+        body.admin_password = f.admin_password.value;
+      }
+      const res = await api('POST', '/api/orgs', body);
+      close();
+      toast('Đã tạo công ty');
+      state.orgs = (await api('GET', '/api/auth/me')).organizations;
+      onDone();
+      // jump straight into the new company
+      state.orgId = res.organization.id;
+      try { localStorage.setItem('orgId', res.organization.id); } catch { /* ignore */ }
+    }),
+  },
+  h('label', {}, 'Tên công ty'), f.name,
+  h('p', { class: 'muted' }, 'Tùy chọn: tạo luôn tài khoản chủ sở hữu (owner) cho công ty này. Để trống nếu bạn tự thêm người dùng sau.'),
+  h('label', {}, 'Email owner'), f.admin_email,
+  h('label', {}, 'Họ tên owner'), f.admin_name,
+  h('label', {}, 'Mật khẩu owner (≥10 ký tự)'), f.admin_password,
+  h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Tạo công ty')));
+  const close = modal('Thêm công ty', form);
 }
 
 async function viewAudit(el) {

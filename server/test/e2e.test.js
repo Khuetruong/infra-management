@@ -19,10 +19,14 @@ const AGENT = path.join(__dirname, '..', '..', 'agent', 'infra_agent.py');
 const AGENT_CFG = path.join(tmp, 'agent.json');
 
 let server, base, db, app;
-async function api(method, url, body, token) {
+async function api(method, url, body, token, orgId) {
   const res = await fetch(base + url, {
     method,
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(orgId ? { 'X-Org-Id': orgId } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json().catch(() => null) };
@@ -147,6 +151,53 @@ test('full flow: setup, RBAC, enroll agent, run tasks, secrets redaction, alerts
   // removing the server revokes its agent
   assert.equal((await api('DELETE', `/api/servers/${srv.id}`, null, owner)).status, 200);
   await assert.rejects(agent('once'));
+});
+
+test('multi-tenant: organizations are isolated', async () => {
+  // owner from the first test is a platform admin
+  const owner = (await api('POST', '/api/auth/login', { email: 'owner@example.com', password: 'correct horse battery' })).body.token;
+  const me = (await api('GET', '/api/auth/me', null, owner)).body;
+  assert.equal(me.user.platform_admin, true);
+  assert.ok(me.org && me.org.id);
+  const orgA = me.user.org_id;
+
+  // create a second company with its own owner
+  const create = await api('POST', '/api/orgs', { name: 'Công ty B', admin_email: 'b-owner@example.com', admin_password: 'company b password' }, owner);
+  assert.equal(create.status, 200);
+  const orgB = create.body.organization.id;
+  assert.notEqual(orgA, orgB);
+
+  // a non-platform-admin cannot list orgs or cross into another org
+  assert.equal((await api('GET', '/api/orgs', null, owner)).body.organizations.length >= 2, true);
+  const bOwner = (await api('POST', '/api/auth/login', { email: 'b-owner@example.com', password: 'company b password' })).body.token;
+  assert.equal((await api('GET', '/api/orgs', null, bOwner)).status, 403);
+  assert.equal((await api('GET', '/api/servers', null, bOwner, orgA)).status, 403, 'non-admin cannot select another org');
+
+  // enroll a server into org B (platform admin selects org B via header)
+  const enrB = await api('POST', '/api/enrollment-tokens', { name: 'b-server' }, owner, orgB);
+  assert.equal(enrB.status, 200);
+  await api('POST', '/api/agent/enroll', { token: enrB.body.token, facts: { hostname: 'bhost' } });
+
+  // org B owner sees exactly their 1 server; org A owner (default org) does NOT see it
+  const bServers = (await api('GET', '/api/servers', null, bOwner)).body.servers;
+  assert.equal(bServers.length, 1);
+  assert.equal(bServers[0].name, 'b-server');
+  const aServers = (await api('GET', '/api/servers', null, owner)).body.servers;
+  assert.equal(aServers.some((s) => s.name === 'b-server'), false);
+
+  // org B owner cannot open org A's server by id
+  const anAServer = aServers[0];
+  if (anAServer) assert.equal((await api('GET', `/api/servers/${anAServer.id}`, null, bOwner)).status, 404);
+
+  // secrets are per-org: same name in both orgs is independent
+  assert.equal((await api('POST', '/api/secrets', { name: 'shared-name', value: 'A-value' }, owner)).status, 200);
+  assert.equal((await api('POST', '/api/secrets', { name: 'shared-name', value: 'B-value' }, bOwner)).status, 200);
+  assert.equal((await api('GET', '/api/secrets', null, bOwner)).body.secrets.length, 1);
+
+  // platform admin viewing org B sees org B's users only
+  const bUsers = (await api('GET', '/api/users', null, owner, orgB)).body.users;
+  assert.equal(bUsers.length, 1);
+  assert.equal(bUsers[0].email, 'b-owner@example.com');
 });
 
 test('static: web UI and agent files are served, traversal blocked', async () => {
