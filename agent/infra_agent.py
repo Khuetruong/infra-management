@@ -971,6 +971,23 @@ def a_net_scan(p, cfg):
     return 0, "\n".join(lines), result
 
 
+def ensure_sshpass():
+    """Make sure sshpass is available on this (scanner) host, installing it if needed."""
+    if which("sshpass"):
+        return True
+    pm = pkg_manager()
+    cmds = {
+        "apt-get": [["apt-get", "update", "-q"], ["apt-get", "install", "-y", "sshpass"]],
+        "dnf": [["dnf", "install", "-y", "sshpass"]],
+        "yum": [["yum", "install", "-y", "sshpass"]],
+        "zypper": [["zypper", "--non-interactive", "install", "sshpass"]],
+        "apk": [["apk", "add", "--no-cache", "sshpass"]],
+    }.get(pm, [])
+    for c in cmds:
+        sh(c, timeout=300, env={"DEBIAN_FRONTEND": "noninteractive"})
+    return which("sshpass") is not None
+
+
 def _ssh_exec(p, cfg, remote_cmd):
     """Run a single command on a remote host over SSH, using a key or password from the vault.
     Returns (exit_code, output)."""
@@ -987,8 +1004,8 @@ def _ssh_exec(p, cfg, remote_cmd):
                 f.write(key if key.endswith("\n") else key + "\n")
             args = ["ssh", "-i", keyfile, "-o", "BatchMode=yes"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]
         elif password:
-            if not which("sshpass"):
-                return 1, "Thiếu 'sshpass' trên server quét để dùng mật khẩu SSH. Hãy dùng SSH key, hoặc cài sshpass."
+            if not ensure_sshpass():
+                return 1, "Không cài được 'sshpass' trên server quét để dùng mật khẩu SSH. Hãy dùng SSH key thay thế."
             args = ["sshpass", "-p", password, "ssh"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]
         else:
             args = ["ssh", "-o", "BatchMode=yes"] + ssh_opts + ["%s@%s" % (user, host), remote_cmd]

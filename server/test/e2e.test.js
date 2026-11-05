@@ -288,6 +288,17 @@ test('network scan: ingest devices, topology, remote install + uninstall, transi
 
   // internal actions cannot be created through the generic task endpoint
   assert.equal((await api('POST', `/api/servers/${scannerId}/tasks`, { action: 'net.remote_install', params: {} }, owner)).status, 400);
+
+  // a Windows server records its platform, and Linux-only actions are refused for it
+  const enrW = await api('POST', '/api/enrollment-tokens', { name: 'win-1' }, owner);
+  const enW = await api('POST', '/api/agent/enroll', { token: enrW.body.token, platform: 'windows', facts: { hostname: 'WINBOX', primary_ip: '10.9.0.50' }, metrics: { cpu_percent: 3 } });
+  assert.equal(enW.status, 200);
+  const winId = enW.body.server_id;
+  const winSrv = (await api('GET', `/api/servers/${winId}`, null, owner)).body.server;
+  assert.equal(winSrv.platform, 'windows');
+  assert.equal((await api('POST', `/api/servers/${winId}/scan`, { targets: '10.0.0.0/24' }, owner)).status, 400, 'scan is Linux-only');
+  // the Windows enrollment command is offered
+  assert.match(enrW.body.install_command_windows, /Install-InfraAgent -Server .* -Token '?enr_/);
 });
 
 test('static: web UI and agent files are served, traversal blocked', async () => {
@@ -296,6 +307,8 @@ test('static: web UI and agent files are served, traversal blocked', async () =>
   assert.match(index.headers.get('content-security-policy'), /default-src 'self'/);
   assert.equal((await fetch(base + '/agent/install.sh')).status, 200);
   assert.equal((await fetch(base + '/agent/infra_agent.py')).status, 200);
+  assert.equal((await fetch(base + '/agent/install.ps1')).status, 200);
+  assert.equal((await fetch(base + '/agent/infra_agent.ps1')).status, 200);
   assert.equal((await fetch(base + '/agent/../server/data/master.key')).status, 404);
   assert.equal((await fetch(base + '/%2e%2e/src/config.js')).status, 404);
 });

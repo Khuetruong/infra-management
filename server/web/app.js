@@ -473,7 +473,13 @@ async function viewServer(el, id) {
   const f = server.facts || {};
 
   const byCat = {};
-  for (const [name, spec] of Object.entries(state.actions)) (byCat[spec.category] ||= []).push([name, spec]);
+  const caps = server.agent_capabilities || [];
+  for (const [name, spec] of Object.entries(state.actions)) {
+    if (spec.internal) continue; // remote install/uninstall: only via the network page
+    if (spec.platforms && !spec.platforms.includes(server.platform || 'linux')) continue;
+    if (caps.length && !caps.includes(name)) continue; // only what this agent reported it can do
+    (byCat[spec.category] ||= []).push([name, spec]);
+  }
   const actionsPanel = h('div', { class: 'panel' }, h('h2', {}, 'Thao tác quản trị'),
     server.status === 'pending' ? h('p', { class: 'muted' }, 'Agent chưa kết nối.')
       : Object.entries(byCat).map(([cat, items]) => h('div', { class: 'cat' }, h('h3', {}, CATEGORY_LABEL[cat] || cat),
