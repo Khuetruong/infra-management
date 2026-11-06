@@ -759,7 +759,7 @@ function connectDialog(device, agentRunners, probeRunners, secrets, onDone) {
 }
 
 function monitorDialog(device, runners, secrets, onDone) {
-  if (!runners.length) return void toast('Cần một agent đang online để giám sát hộ thiết bị', true);
+  if (!runners.length) return void toast('Chưa có agent nào online hỗ trợ giám sát. Hãy chạy lại lệnh cài agent (để cập nhật khả năng net.probe) rồi thử lại, hoặc mở lại máy có agent.', true);
   const runner = h('select', {}, runners.map((x) => h('option', { value: x.id, selected: x.id === device.scanner_server_id }, `${x.name} (${(x.platform || 'linux') === 'windows' ? 'Windows' : 'Linux'}, ${x.ip || x.id})`)));
   const ports = h('input', { placeholder: 'để trống = bộ cổng phổ biến; vd: 80,443,161' });
   const interval = h('select', {}, [['60', '1 phút'], ['300', '5 phút'], ['900', '15 phút'], ['3600', '1 giờ']].map(([v, l]) => h('option', { value: v, selected: v === '300' }, l)));
