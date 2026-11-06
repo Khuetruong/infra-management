@@ -210,7 +210,17 @@ async function migrate(d, pg) {
   };
   for (const [table, col, ddl] of ADD_COLUMNS) {
     const cols = await existing(table);
-    if (!cols.includes(col)) await d.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+    if (!cols.includes(col)) {
+      // Concurrent serverless cold-starts can both pass the check and race the ALTER; a loser
+      // gets Postgres 42701 (duplicate column) / SQLite "duplicate column". The column exists
+      // either way, so swallow that and let migrate() finish instead of 500-ing every request.
+      try {
+        await d.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+      } catch (e) {
+        if (e && (e.code === '42701' || /duplicate column/i.test(e.message || ''))) continue;
+        throw e;
+      }
+    }
   }
   // 2. drop the old global-unique constraint on secrets.name (Postgres only; SQLite installs are fresh)
   if (pg) {
