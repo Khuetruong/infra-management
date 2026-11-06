@@ -385,6 +385,30 @@ function addServerDialog(onDone) {
   const close = modal('Thêm server', body);
 }
 
+// Onboard a discovered device without a Linux SSH runner: mint a one-time token and show the
+// install command to run ON that device (works for any OS the device runs).
+async function directInstallDialog(device, onDone) {
+  const body = h('div', {}, h('p', { class: 'muted' }, 'Đang tạo lệnh cài…'));
+  const close = modal(`Cài agent trực tiếp: ${device.ip || device.hostname || ''}`, body);
+  try {
+    const res = await api('POST', '/api/enrollment-tokens', { name: device.hostname || device.ip, tags: [device.ip].filter(Boolean) });
+    const insecure = res.install_command.includes('--server http://');
+    fill(body,
+      h('p', {}, 'Chạy lệnh dưới đây ', h('strong', {}, 'trên chính thiết bị '), h('span', { class: 'mono' }, device.ip || device.hostname || ''),
+        '. Token dùng một lần, hết hạn lúc ', h('strong', {}, fmtTime(res.expires_at)), '.'),
+      h('h3', { style: null }, 'Linux (cần root, systemd, python3)'),
+      copyBox(res.install_command + (insecure ? ' --insecure-http' : '')),
+      h('h3', { style: null }, 'Windows (PowerShell quyền Administrator)'),
+      copyBox(res.install_command_windows || ''),
+      insecure && h('p', { class: 'err' }, 'Nền tảng đang chạy HTTP — chỉ dùng cho môi trường thử nghiệm.'),
+      h('p', { class: 'muted' }, 'Sau khi cài, thiết bị tự enroll và hiện trong danh sách Server. Lần quét mạng sau, thiết bị này sẽ chuyển sang trạng thái "đã quản lý".'),
+      h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => { close(); onDone && onDone(); } }, 'Xong')));
+  } catch (e) {
+    fill(body, h('div', { class: 'err' }, e.message),
+      h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Đóng')));
+  }
+}
+
 async function viewServers(el) {
   const list = h('div', {});
   const draw = async () => {
@@ -626,7 +650,7 @@ async function viewNetwork(el) {
     h('td', {}, h('span', { class: `badge b-${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'open'}` }, DEVICE_STATUS_LABEL[d.status] || d.status),
       d.managed_server_id ? h('div', {}, h('a', { href: `#/servers/${d.managed_server_id}` }, 'mở server')) : null),
     h('td', {}, h('div', { class: 'row' },
-      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'install') }, 'Kết nối'),
+      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => (sshRunners.length ? manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'install') : directInstallDialog(d, guard(draw))) }, 'Kết nối'),
       can('admin') && d.status === 'managed' && h('button', { class: 'small', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
       can('operator') && h('button', { class: 'small danger', onclick: guard(async () => { await api('DELETE', `/api/devices/${d.id}`); draw(); }) }, 'Xoá'))));
 
@@ -748,6 +772,7 @@ function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'insta
     h('label', {}, 'SSH private key từ kho bí mật'), keySecret),
   installOnly, uninstallOnly,
   h('p', { class: 'muted' }, 'Nhập username + mật khẩu rồi bấm nút bên dưới để tự động đẩy cài/gỡ. Mật khẩu nhập trực tiếp được mã hoá, dùng một lần rồi tự xoá. Dùng mật khẩu cần có "sshpass" trên máy quét (hoặc dùng SSH key).'),
+  op.value !== 'uninstall' && h('p', { class: 'muted' }, 'Hoặc ', h('a', { href: '#', onclick: (e) => { e.preventDefault(); close(); directInstallDialog(device, onDone); } }, 'cài trực tiếp trên thiết bị (không cần SSH)'), '.'),
   h('div', { class: 'actions' }, submitBtn));
   const close = modal('Quản lý agent trên thiết bị', form);
   syncOp();
