@@ -518,8 +518,22 @@ function createApp(db) {
     const operation = b.operation === 'uninstall' ? 'uninstall' : 'install';
     if (b.confirm !== true) throw new HttpError(400, 'Thao tác thay đổi thiết bị: cần xác nhận (confirm: true)');
     const osName = b.os === 'windows' ? 'windows' : 'linux';
-    const scanner = b.scanner_server_id ? await getServer(b.scanner_server_id, ctx.orgId) : await one("SELECT * FROM servers WHERE org_id = ? AND status = 'online' AND platform = 'linux' ORDER BY last_seen_at DESC", ctx.orgId);
-    if (!scanner) throw new HttpError(400, 'Cần một agent Linux đang online để thực hiện từ xa');
+    let scanner = null;
+    if (b.scanner_server_id) {
+      scanner = await getServer(b.scanner_server_id, ctx.orgId);
+    } else {
+      // Pick any online agent (Linux or Windows) that can install remotely. Prefer a Linux
+      // runner for a Linux target (SSH key/password) and a Windows runner for a Windows target
+      // (WinRM), falling back to whatever online runner can do it.
+      const candidates = await all("SELECT * FROM servers WHERE org_id = ? AND status = 'online' ORDER BY last_seen_at DESC", ctx.orgId);
+      const canInstall = candidates.filter((s) => {
+        let caps = s.agent_capabilities;
+        if (typeof caps === 'string') { try { caps = JSON.parse(caps); } catch { caps = []; } }
+        return Array.isArray(caps) && caps.includes('net.remote_install');
+      });
+      scanner = canInstall.find((s) => (s.platform || 'linux') === osName) || canInstall[0] || null;
+    }
+    if (!scanner) throw new HttpError(400, 'Cần một agent (Linux hoặc Windows) đang online và hỗ trợ cài từ xa để thực hiện');
     if (scanner.status === 'pending') throw new HttpError(409, 'Agent quét chưa kết nối');
 
     // resolve credentials: inline password/key -> transient secret; else named vault secret

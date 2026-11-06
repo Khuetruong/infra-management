@@ -636,7 +636,7 @@ async function viewNetwork(el) {
   // Any online agent that advertises net.scan can be a scanner (Linux or Windows).
   const scanners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.scan'));
   // Remote agent install/uninstall rides over SSH from a Linux scanner only.
-  const sshRunners = servers.filter((s2) => (s2.platform || 'linux') === 'linux' && s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.remote_install'));
+  const sshRunners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.remote_install'));
   const serverById = Object.fromEntries(servers.map((x) => [x.id, x]));
   const box = h('div', {});
 
@@ -719,14 +719,14 @@ function scanDialog(scanners, secrets, onDone) {
 }
 
 function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'install') {
-  if (!scanners.length) return void toast('Cần một agent Linux đang online để thực hiện từ xa', true);
+  if (!scanners.length) return void toast('Cần một agent (Linux hoặc Windows) đang online hỗ trợ cài từ xa', true);
   const op = h('select', {},
     h('option', { value: 'install', selected: defaultOp === 'install' }, 'Cài agent'),
     h('option', { value: 'uninstall', selected: defaultOp === 'uninstall' }, 'Gỡ agent'));
-  const scanner = h('select', {}, scanners.map((x) => h('option', { value: x.id, selected: x.id === device.scanner_server_id }, `${x.name} (${x.ip || x.id})`)));
-  const os = h('select', {}, h('option', { value: 'linux', selected: !/windows/i.test(device.device_type || '') }, 'Linux (SSH)'), h('option', { value: 'windows', selected: /windows/i.test(device.device_type || '') }, 'Windows (SSH/OpenSSH)'));
+  const scanner = h('select', {}, scanners.map((x) => h('option', { value: x.id, selected: x.id === device.scanner_server_id }, `${x.name} (${(x.platform || 'linux') === 'windows' ? 'Windows' : 'Linux'}, ${x.ip || x.id})`)));
+  const os = h('select', {}, h('option', { value: 'linux', selected: !/windows/i.test(device.device_type || '') }, 'Linux'), h('option', { value: 'windows', selected: /windows/i.test(device.device_type || '') }, 'Windows'));
   const user = h('input', { value: 'root', placeholder: 'username', autocomplete: 'off' });
-  const pass = h('input', { type: 'password', placeholder: 'mật khẩu SSH', autocomplete: 'new-password' });
+  const pass = h('input', { type: 'password', placeholder: 'mật khẩu', autocomplete: 'new-password' });
   const port = h('input', { type: 'number', value: 22, min: 1, max: 65535 });
   const name = h('input', { value: device.hostname || device.ip });
   const purge = h('input', { type: 'checkbox' });
@@ -734,14 +734,37 @@ function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'insta
   const keySecret = h('select', {}, h('option', { value: '' }, '(không dùng SSH key)'), secrets.map((x) => h('option', { value: x.name }, x.name)));
   const installOnly = h('div', {}, h('label', {}, 'Tên server khi thêm vào'), name);
   const uninstallOnly = h('label', { class: 'check', hidden: true }, purge, 'Xoá luôn cấu hình trên máy (--purge)');
+  const methodHint = h('p', { class: 'muted' });
   const submitBtn = h('button', { class: 'primary', type: 'submit' }, 'Cài & đưa vào quản lý');
+  const runnerPlatform = () => {
+    const s = scanners.find((x) => x.id === scanner.value);
+    return (s && s.platform) === 'windows' ? 'windows' : 'linux';
+  };
   const syncOp = () => {
     const uninstall = op.value === 'uninstall';
     installOnly.hidden = uninstall;
     uninstallOnly.hidden = !uninstall;
     submitBtn.textContent = uninstall ? 'Gỡ agent khỏi máy' : 'Cài & đưa vào quản lý';
+    // Connection method depends on runner platform + target OS:
+    //  - target Linux       → SSH (key hoặc mật khẩu; mật khẩu cần sshpass trên runner Linux)
+    //  - target Windows, runner Windows → WinRM (username + mật khẩu Administrator)
+    //  - target Windows, runner Linux   → SSH tới OpenSSH trên máy Windows
+    const runner = runnerPlatform();
+    if (os.value === 'windows') {
+      if (runner === 'windows') {
+        methodHint.textContent = 'Phương thức: WinRM. Cần username + mật khẩu Administrator của máy Windows đích, và WinRM đã bật (winrm quickconfig). SSH key không dùng cho đường này.';
+        if (user.value === 'root') user.value = 'Administrator';
+      } else {
+        methodHint.textContent = 'Phương thức: SSH tới OpenSSH Server trên máy Windows đích (cần đã bật). Dùng username + mật khẩu hoặc SSH key.';
+      }
+    } else {
+      methodHint.textContent = 'Phương thức: SSH. Dùng SSH key (khuyến nghị) hoặc mật khẩu. Mật khẩu từ runner Linux cần có "sshpass".';
+      if (user.value === 'Administrator') user.value = 'root';
+    }
   };
   op.addEventListener('change', syncOp);
+  os.addEventListener('change', syncOp);
+  scanner.addEventListener('change', syncOp);
   const form = h('form', {
     onsubmit: guard(async (e) => {
       e.preventDefault();
@@ -759,19 +782,20 @@ function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'insta
       showTask(task.id);
     }),
   },
-  h('p', {}, 'Thiết bị ', h('strong', { class: 'mono' }, device.ip), device.hostname ? ` (${device.hostname})` : '', '. Thao tác chạy từ agent quét qua SSH và được ghi vào nhật ký audit.'),
+  h('p', {}, 'Thiết bị ', h('strong', { class: 'mono' }, device.ip), device.hostname ? ` (${device.hostname})` : '', '. Thao tác chạy từ agent được chọn (từ xa) và được ghi vào nhật ký audit.'),
   h('label', {}, 'Thao tác'), op,
-  h('label', {}, 'Agent thực hiện (Linux, online)'), scanner,
+  h('label', {}, 'Agent thực hiện (online)'), scanner,
   h('label', {}, 'Hệ điều hành thiết bị'), os,
+  methodHint,
   h('div', { class: 'grid two' },
-    h('div', {}, h('label', {}, 'Tài khoản SSH (username)'), user),
-    h('div', {}, h('label', {}, 'Cổng SSH'), port)),
-  h('label', {}, 'Mật khẩu SSH'), pass,
+    h('div', {}, h('label', {}, 'Tài khoản (username)'), user),
+    h('div', {}, h('label', {}, 'Cổng SSH (chỉ dùng cho SSH)'), port)),
+  h('label', {}, 'Mật khẩu'), pass,
   h('details', {}, h('summary', { class: 'muted' }, 'Hoặc dùng thông tin từ kho bí mật / SSH key'),
     h('label', {}, 'Mật khẩu từ kho bí mật'), pwSecret,
-    h('label', {}, 'SSH private key từ kho bí mật'), keySecret),
+    h('label', {}, 'SSH private key từ kho bí mật (chỉ cho đường SSH)'), keySecret),
   installOnly, uninstallOnly,
-  h('p', { class: 'muted' }, 'Nhập username + mật khẩu rồi bấm nút bên dưới để tự động đẩy cài/gỡ. Mật khẩu nhập trực tiếp được mã hoá, dùng một lần rồi tự xoá. Dùng mật khẩu cần có "sshpass" trên máy quét (hoặc dùng SSH key).'),
+  h('p', { class: 'muted' }, 'Nhập thông tin đăng nhập rồi bấm nút bên dưới để tự động đẩy cài/gỡ từ nền tảng. Mật khẩu nhập trực tiếp được mã hoá, dùng một lần rồi tự xoá.'),
   op.value !== 'uninstall' && h('p', { class: 'muted' }, 'Hoặc ', h('a', { href: '#', onclick: (e) => { e.preventDefault(); close(); directInstallDialog(device, onDone); } }, 'cài trực tiếp trên thiết bị (không cần SSH)'), '.'),
   h('div', { class: 'actions' }, submitBtn));
   const close = modal('Quản lý agent trên thiết bị', form);

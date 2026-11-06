@@ -57,7 +57,7 @@ const ACTIONS = {
     deep: { type: 'bool', default: false },
     snmp_community: { type: 'secret' },
   } },
-  'net.remote_install':   { category: 'network',  title: 'Cài agent từ xa tới thiết bị', minRole: 'admin', destructive: true, platforms: ['linux'], internal: true, params: {
+  'net.remote_install':   { category: 'network',  title: 'Cài agent từ xa tới thiết bị', minRole: 'admin', destructive: true, platforms: ['linux', 'windows'], internal: true, params: {
     host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
     os: { type: 'enum', values: ['linux', 'windows'], default: 'linux' },
     ssh_user: { type: 'string', pattern: NAME, default: 'root' },
@@ -67,7 +67,7 @@ const ACTIONS = {
     ssh_password: { type: 'secret' },
     ssh_key: { type: 'secret' },
   } },
-  'net.remote_uninstall': { category: 'network',  title: 'Gỡ agent từ xa khỏi thiết bị', minRole: 'admin', destructive: true, platforms: ['linux'], internal: true, params: {
+  'net.remote_uninstall': { category: 'network',  title: 'Gỡ agent từ xa khỏi thiết bị', minRole: 'admin', destructive: true, platforms: ['linux', 'windows'], internal: true, params: {
     host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
     os: { type: 'enum', values: ['linux', 'windows'], default: 'linux' },
     ssh_user: { type: 'string', pattern: NAME, default: 'root' },

@@ -161,6 +161,8 @@ $script:ACTIONS = [ordered]@{
   'security.disable_guest'    = @{}
   'shell.exec'                = @{ command = @{ type = 'shell' } }
   'net.scan'                  = @{ targets = @{ type = 'string'; pattern = '^[0-9A-Fa-f:.,/ ]{0,512}$' }; ports = @{ type = 'string'; pattern = '^[0-9, ]{0,256}$' }; deep = @{ type = 'bool'; default = $false }; snmp_community = @{ type = 'secret' } }
+  'net.remote_install'        = @{ host = @{ type = 'string'; pattern = '^[0-9A-Za-z._:-]{1,255}$'; required = $true }; os = @{ type = 'enum'; values = @('linux', 'windows'); default = 'linux' }; ssh_user = @{ type = 'string'; pattern = '^[A-Za-z0-9._-]{1,64}$' }; ssh_port = @{ type = 'int'; min = 1; max = 65535; default = 22 }; server_url = @{ type = 'string'; pattern = '^https?://[^\s]{3,256}$'; required = $true }; enroll_token = @{ type = 'string'; pattern = '^[A-Za-z0-9_-]{8,160}$'; required = $true }; ssh_password = @{ type = 'secret' }; ssh_key = @{ type = 'secret' } }
+  'net.remote_uninstall'      = @{ host = @{ type = 'string'; pattern = '^[0-9A-Za-z._:-]{1,255}$'; required = $true }; os = @{ type = 'enum'; values = @('linux', 'windows'); default = 'linux' }; ssh_user = @{ type = 'string'; pattern = '^[A-Za-z0-9._-]{1,64}$' }; ssh_port = @{ type = 'int'; min = 1; max = 65535; default = 22 }; server_url = @{ type = 'string'; pattern = '^https?://[^\s]{3,256}$'; required = $true }; purge = @{ type = 'bool'; default = $false }; ssh_password = @{ type = 'secret' }; ssh_key = @{ type = 'secret' } }
 }
 
 class Rejected : System.Exception { Rejected([string]$m) : base($m) {} }
@@ -706,6 +708,111 @@ function Act-NetScan {
   return (New-Result 0 ($lines -join "`n") $result)
 }
 
+# ----------------------------------------------------------------------------- remote agent install (mirrors the Linux agent's net.remote_install)
+# Note: $host is a PowerShell automatic variable (the host object) — always use $targetHost here.
+function Invoke-SshExec {
+  param($targetHost, $user, $port, $key, $password, $remoteCmd)
+  $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+  if (-not $ssh) {
+    return (New-Result 1 "Khong tim thay ssh.exe tren may agent Windows. Cai 'OpenSSH Client' (Settings > Apps > Optional Features) roi thu lai, hoac dung mot agent Linux de cai qua SSH." $null)
+  }
+  $opts = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=12', '-o', 'NumberOfPasswordPrompts=1', '-p', [string]$port)
+  $keyfile = $null
+  try {
+    if ($key) {
+      $keyfile = Join-Path $env:TEMP ("infra_rk_" + [Guid]::NewGuid().ToString('N'))
+      $txt = if ($key.EndsWith("`n")) { $key } else { $key + "`n" }
+      [System.IO.File]::WriteAllText($keyfile, $txt, (New-Object System.Text.UTF8Encoding($false)))
+      try { & icacls.exe $keyfile /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null } catch {}
+      $sshArgs = @('-i', $keyfile, '-o', 'BatchMode=yes') + $opts + @("$user@$targetHost", $remoteCmd)
+    } elseif ($password) {
+      return (New-Result 1 "Cai qua SSH bang mat khau khong duoc ho tro tu agent Windows (thieu sshpass). Hay dung SSH key, dung mot agent Linux, hoac cai thiet bi Windows qua WinRM." $null)
+    } else {
+      $sshArgs = @('-o', 'BatchMode=yes') + $opts + @("$user@$targetHost", $remoteCmd)
+    }
+    $out = & $ssh.Path @sshArgs 2>&1 | Out-String
+    return (New-Result $LASTEXITCODE $out $null)
+  } finally {
+    if ($keyfile -and (Test-Path $keyfile)) { Remove-Item $keyfile -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Invoke-WinrmExec {
+  param($targetHost, $user, $password, $scriptBlock, $argList)
+  if (-not $password) {
+    return (New-Result 1 "Cai thiet bi Windows tu xa qua WinRM can mat khau cho tai khoan '$user'. Hay nhap mat khau Administrator cua may dich." $null)
+  }
+  $secpw = ConvertTo-SecureString $password -AsPlainText -Force
+  $cred = New-Object System.Management.Automation.PSCredential($user, $secpw)
+  try {
+    $cur = $null
+    try { $cur = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value } catch {}
+    $known = if ($cur) { @($cur -split ',' | ForEach-Object { $_.Trim() }) } else { @() }
+    if ($cur -ne '*' -and $known -notcontains $targetHost) {
+      try { Set-Item WSMan:\localhost\Client\TrustedHosts -Value $targetHost -Concatenate -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    $out = Invoke-Command -ComputerName $targetHost -Credential $cred -ScriptBlock $scriptBlock -ArgumentList $argList -ErrorAction Stop 2>&1 | Out-String
+    return (New-Result 0 $out $null)
+  } catch {
+    return (New-Result 1 ("WinRM toi $targetHost that bai: " + $_.Exception.Message + ". Dam bao WinRM da bat tren may dich (chay 'winrm quickconfig') va tai khoan co quyen Administrator.") $null)
+  }
+}
+
+function Act-NetRemoteInstall {
+  param($p, $cfg)
+  $targetHost = $p['host']
+  $osName = if ($p.ContainsKey('os') -and $p['os']) { $p['os'] } else { 'linux' }
+  $url = ([string]$p['server_url']).TrimEnd('/')
+  $token = $p['enroll_token']
+  $user = if ($p.ContainsKey('ssh_user') -and $p['ssh_user']) { $p['ssh_user'] } else { 'root' }
+  $port = if ($p.ContainsKey('ssh_port') -and $p['ssh_port']) { [int]$p['ssh_port'] } else { 22 }
+  $key = if ($p.ContainsKey('ssh_key')) { $p['ssh_key'] } else { $null }
+  $password = if ($p.ContainsKey('ssh_password')) { $p['ssh_password'] } else { $null }
+  if ($osName -eq 'windows') {
+    $sb = {
+      param($u, $t)
+      try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+      Invoke-WebRequest -Uri "$u/agent/install.ps1" -UseBasicParsing | Select-Object -ExpandProperty Content | Invoke-Expression
+      Install-InfraAgent -Server $u -Token $t
+    }
+    $r = Invoke-WinrmExec $targetHost $user $password $sb @($url, $token)
+  } else {
+    $sudo = if ($user -eq 'root') { '' } else { 'sudo -n ' }
+    $remote = "curl -fsSL $url/agent/install.sh | ${sudo}bash -s -- --server $url --token $token"
+    $r = Invoke-SshExec $targetHost $user $port $key $password $remote
+  }
+  $meta = @{ host = $targetHost; os = $osName; installed = ($r.code -eq 0) }
+  return (New-Result $r.code $r.output $meta)
+}
+
+function Act-NetRemoteUninstall {
+  param($p, $cfg)
+  $targetHost = $p['host']
+  $osName = if ($p.ContainsKey('os') -and $p['os']) { $p['os'] } else { 'linux' }
+  $url = ([string]$p['server_url']).TrimEnd('/')
+  $user = if ($p.ContainsKey('ssh_user') -and $p['ssh_user']) { $p['ssh_user'] } else { 'root' }
+  $port = if ($p.ContainsKey('ssh_port') -and $p['ssh_port']) { [int]$p['ssh_port'] } else { 22 }
+  $key = if ($p.ContainsKey('ssh_key')) { $p['ssh_key'] } else { $null }
+  $password = if ($p.ContainsKey('ssh_password')) { $p['ssh_password'] } else { $null }
+  $purge = ($p.ContainsKey('purge') -and $p['purge'])
+  if ($osName -eq 'windows') {
+    $sb = {
+      param($u, $pg)
+      try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+      Invoke-WebRequest -Uri "$u/agent/install.ps1" -UseBasicParsing | Select-Object -ExpandProperty Content | Invoke-Expression
+      if ($pg) { Uninstall-InfraAgent -Purge } else { Uninstall-InfraAgent }
+    }
+    $r = Invoke-WinrmExec $targetHost $user $password $sb @($url, [bool]$purge)
+  } else {
+    $sudo = if ($user -eq 'root') { '' } else { 'sudo -n ' }
+    $flag = if ($purge) { ' --purge' } else { ' --uninstall' }
+    $remote = "curl -fsSL $url/agent/install.sh | ${sudo}bash -s --$flag"
+    $r = Invoke-SshExec $targetHost $user $port $key $password $remote
+  }
+  $meta = @{ host = $targetHost; os = $osName; uninstalled = ($r.code -eq 0) }
+  return (New-Result $r.code $r.output $meta)
+}
+
 $script:HANDLERS = @{
   'system.info'              = { param($p, $c) Act-SystemInfo }
   'system.disk_usage'        = { param($p, $c) Act-DiskUsage }
@@ -732,6 +839,8 @@ $script:HANDLERS = @{
   'security.disable_guest'   = { param($p, $c) Act-DisableGuest }
   'shell.exec'               = { param($p, $c) Act-Shell $p $c }
   'net.scan'                 = { param($p, $c) Act-NetScan $p $c }
+  'net.remote_install'       = { param($p, $c) Act-NetRemoteInstall $p $c }
+  'net.remote_uninstall'     = { param($p, $c) Act-NetRemoteUninstall $p $c }
 }
 
 function Invoke-Task {
