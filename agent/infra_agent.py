@@ -77,6 +77,11 @@ ACTIONS = {
         "deep": ("bool", False),
         "snmp_community": ("secret",),
     },
+    "net.probe": {
+        "host": ("str", IP, None),
+        "ports": ("str?", r"[0-9, ]{0,256}", None),
+        "snmp_community": ("secret",),
+    },
     "net.remote_install": {
         "host": ("str", IP, None),
         "os": ("enum", ("linux", "windows"), "linux"),
@@ -1213,6 +1218,49 @@ def a_net_scan(p, cfg):
     return 0, "\n".join(lines), result
 
 
+PROBE_PORTS = [22, 23, 53, 80, 161, 443, 445, 515, 631, 3389, 8080, 8443, 9100, 62078]
+
+
+def a_net_probe(p, cfg):
+    """Agentless health probe of one device (router, AP, IoT, phone, …): liveness (ping + TCP),
+    open ports, reverse DNS and best-effort SNMP. No software is installed on the target."""
+    host = p["host"]
+    if p.get("ports"):
+        try:
+            ports = sorted({int(x) for x in re.split(r"[,\s]+", p["ports"].strip()) if x})
+        except ValueError:
+            ports = PROBE_PORTS
+    else:
+        ports = PROBE_PORTS
+    alive = ping(host)
+    open_ports, latency_ms = [], None
+    for port in ports:
+        t0 = time.time()
+        if tcp_open(host, port, timeout=0.6):
+            open_ports.append(port)
+            if latency_ms is None:
+                latency_ms = int(round((time.time() - t0) * 1000))
+    online = bool(alive or open_ports)  # TCP reply counts even if ICMP is filtered
+    hostname = reverse_dns(host)
+    snmp = None
+    community = p.get("snmp_community")
+    if community:
+        snmp = snmp_get(host, community, ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.5.0"])
+    result = {
+        "host": host, "online": online, "latency_ms": latency_ms,
+        "open_ports": [{"port": po, "proto": "tcp", "service": PORT_SERVICE.get(po)} for po in open_ports],
+        "hostname": hostname, "snmp": snmp,
+    }
+    line = "%s: %s" % (host, "ONLINE" if online else "OFFLINE")
+    if latency_ms is not None:
+        line += " (%d ms)" % latency_ms
+    if open_ports:
+        line += " | cổng mở: " + ", ".join(str(x) for x in open_ports)
+    if hostname:
+        line += " | " + hostname
+    return 0, line, result
+
+
 def ensure_sshpass():
     """Make sure sshpass is available on this (scanner) host, installing it if needed."""
     if which("sshpass"):
@@ -1319,6 +1367,7 @@ HANDLERS = {
     "db.mysql.backup": a_mysql_backup,
     "db.backups.list": a_backups_list,
     "net.scan": a_net_scan,
+    "net.probe": a_net_probe,
     "net.remote_install": a_net_remote_install,
     "net.remote_uninstall": a_net_remote_uninstall,
     "shell.exec": a_shell,

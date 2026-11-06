@@ -161,6 +161,7 @@ $script:ACTIONS = [ordered]@{
   'security.disable_guest'    = @{}
   'shell.exec'                = @{ command = @{ type = 'shell' } }
   'net.scan'                  = @{ targets = @{ type = 'string'; pattern = '^[0-9A-Fa-f:.,/ ]{0,512}$' }; ports = @{ type = 'string'; pattern = '^[0-9, ]{0,256}$' }; deep = @{ type = 'bool'; default = $false }; snmp_community = @{ type = 'secret' } }
+  'net.probe'                 = @{ host = @{ type = 'string'; pattern = '^[0-9A-Za-z._:-]{1,255}$'; required = $true }; ports = @{ type = 'string'; pattern = '^[0-9, ]{0,256}$' }; snmp_community = @{ type = 'secret' } }
   'net.remote_install'        = @{ host = @{ type = 'string'; pattern = '^[0-9A-Za-z._:-]{1,255}$'; required = $true }; os = @{ type = 'enum'; values = @('linux', 'windows'); default = 'linux' }; ssh_user = @{ type = 'string'; pattern = '^[A-Za-z0-9._-]{1,64}$' }; ssh_port = @{ type = 'int'; min = 1; max = 65535; default = 22 }; server_url = @{ type = 'string'; pattern = '^https?://[^\s]{3,256}$'; required = $true }; enroll_token = @{ type = 'string'; pattern = '^[A-Za-z0-9_-]{8,160}$'; required = $true }; ssh_password = @{ type = 'secret' }; ssh_key = @{ type = 'secret' } }
   'net.remote_uninstall'      = @{ host = @{ type = 'string'; pattern = '^[0-9A-Za-z._:-]{1,255}$'; required = $true }; os = @{ type = 'enum'; values = @('linux', 'windows'); default = 'linux' }; ssh_user = @{ type = 'string'; pattern = '^[A-Za-z0-9._-]{1,64}$' }; ssh_port = @{ type = 'int'; min = 1; max = 65535; default = 22 }; server_url = @{ type = 'string'; pattern = '^https?://[^\s]{3,256}$'; required = $true }; purge = @{ type = 'bool'; default = $false }; ssh_password = @{ type = 'secret' }; ssh_key = @{ type = 'secret' } }
 }
@@ -708,6 +709,36 @@ function Act-NetScan {
   return (New-Result 0 ($lines -join "`n") $result)
 }
 
+# ----------------------------------------------------------------------------- agentless device probe (mirrors the Linux agent's net.probe)
+function Act-NetProbe {
+  param($p, $cfg)
+  $targetHost = $p['host']
+  $ports = $script:DEFAULT_PORTS
+  if ($p.ContainsKey('ports') -and $p['ports']) {
+    $pl = @(); foreach ($x in ($p['ports'] -split '[,\s]+')) { if ($x) { $n = 0; if ([int]::TryParse([string]$x, [ref]$n)) { $pl += $n } } }
+    if ($pl.Count -gt 0) { $ports = @($pl | Sort-Object -Unique) }
+  }
+  $online = $false; $latency = $null
+  try {
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    $r = $ping.Send($targetHost, 1000)
+    if ($r -and ([string]$r.Status) -eq 'Success') { $online = $true; $latency = [int]$r.RoundtripTime }
+    $ping.Dispose()
+  } catch {}
+  $portMap = Test-TcpPortsBulk @($targetHost) $ports 700
+  $openPorts = @(); if ($portMap.ContainsKey($targetHost)) { $openPorts = @($portMap[$targetHost] | Sort-Object) }
+  if ($openPorts.Count -gt 0) { $online = $true }
+  $hostname = Resolve-ReverseDns $targetHost
+  $op = New-Object System.Collections.ArrayList
+  foreach ($po in $openPorts) { [void]$op.Add(@{ port = [int]$po; proto = 'tcp'; service = $script:PORT_SERVICE[[int]$po] }) }
+  $result = @{ host = $targetHost; online = [bool]$online; latency_ms = $latency; open_ports = $op; hostname = $hostname; snmp = $null }
+  $line = "$targetHost : " + $(if ($online) { 'ONLINE' } else { 'OFFLINE' })
+  if ($null -ne $latency) { $line += " ($latency ms)" }
+  if ($openPorts.Count -gt 0) { $line += " | cong mo: " + ($openPorts -join ', ') }
+  if ($hostname) { $line += " | $hostname" }
+  return (New-Result 0 $line $result)
+}
+
 # ----------------------------------------------------------------------------- remote agent install (mirrors the Linux agent's net.remote_install)
 # Note: $host is a PowerShell automatic variable (the host object) — always use $targetHost here.
 function Invoke-SshExec {
@@ -839,6 +870,7 @@ $script:HANDLERS = @{
   'security.disable_guest'   = { param($p, $c) Act-DisableGuest }
   'shell.exec'               = { param($p, $c) Act-Shell $p $c }
   'net.scan'                 = { param($p, $c) Act-NetScan $p $c }
+  'net.probe'                = { param($p, $c) Act-NetProbe $p $c }
   'net.remote_install'       = { param($p, $c) Act-NetRemoteInstall $p $c }
   'net.remote_uninstall'     = { param($p, $c) Act-NetRemoteUninstall $p $c }
 }

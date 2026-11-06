@@ -635,23 +635,37 @@ async function viewNetwork(el) {
   ]);
   // Any online agent that advertises net.scan can be a scanner (Linux or Windows).
   const scanners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.scan'));
-  // Remote agent install/uninstall rides over SSH from a Linux scanner only.
+  // Remote agent install/uninstall can ride from any agent that advertises it (Linux→SSH, Windows→WinRM).
   const sshRunners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.remote_install'));
+  // Agentless monitoring can be run by any agent advertising net.probe.
+  const probeRunners = servers.filter((s2) => s2.status !== 'pending' && (s2.agent_capabilities || []).includes('net.probe'));
   const serverById = Object.fromEntries(servers.map((x) => [x.id, x]));
   const box = h('div', {});
 
+  const agentless = (d) => d.managed_mode === 'agentless';
+  const statusCell = (d) => {
+    if (agentless(d)) {
+      const up = d.monitor_state?.online;
+      const lat = d.monitor_state?.latency_ms;
+      return h('td', {}, h('span', { class: `badge b-${up ? 'online' : 'open'}` }, up ? 'Giám sát · online' : (d.monitor_state ? 'Giám sát · offline' : 'Giám sát')),
+        (up && lat != null) ? h('div', { class: 'muted small' }, `${lat} ms`) : null,
+        d.last_probe_at ? h('div', { class: 'muted small' }, `kiểm tra ${ago(d.last_probe_at)}`) : null);
+    }
+    return h('td', {}, h('span', { class: `badge b-${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'open'}` }, DEVICE_STATUS_LABEL[d.status] || d.status),
+      d.managed_server_id ? h('div', {}, h('a', { href: `#/servers/${d.managed_server_id}` }, 'mở server')) : null);
+  };
   const deviceRow = (d) => h('tr', {},
-    h('td', {}, h('span', { class: `dot ${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'offline'}` }), h('strong', { class: 'mono' }, d.ip || '—')),
+    h('td', {}, h('span', { class: `dot ${agentless(d) ? (d.monitor_state?.online ? 'online' : 'offline') : d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'offline'}` }), h('strong', { class: 'mono' }, d.ip || '—')),
     h('td', { class: 'mono' }, d.mac || '—'),
     h('td', {}, d.vendor || (d.snmp?.sysName ? '' : '—')),
     h('td', {}, d.hostname || d.snmp?.sysName || '—'),
     h('td', {}, `${deviceTypeIcon(d.device_type)} ${d.device_type || '—'}`),
     h('td', { class: 'mono small' }, portsLabel(d.open_ports) || '—'),
-    h('td', {}, h('span', { class: `badge b-${d.status === 'managed' ? 'online' : d.status === 'connecting' ? 'pending' : 'open'}` }, DEVICE_STATUS_LABEL[d.status] || d.status),
-      d.managed_server_id ? h('div', {}, h('a', { href: `#/servers/${d.managed_server_id}` }, 'mở server')) : null),
+    statusCell(d),
     h('td', {}, h('div', { class: 'row' },
-      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => (sshRunners.length ? manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'install') : directInstallDialog(d, guard(draw))) }, 'Kết nối'),
-      can('admin') && d.status === 'managed' && h('button', { class: 'small', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
+      can('admin') && d.status !== 'managed' && h('button', { class: 'small primary', onclick: () => connectDialog(d, sshRunners, probeRunners, secretsRes.secrets, guard(draw)) }, 'Kết nối'),
+      can('admin') && d.status === 'managed' && agentless(d) && h('button', { class: 'small', onclick: guard(async () => { await api('POST', `/api/devices/${d.id}/unmonitor`); toast('Đã dừng giám sát'); draw(); }) }, 'Dừng giám sát'),
+      can('admin') && d.status === 'managed' && !agentless(d) && h('button', { class: 'small', onclick: () => manageAgentDialog(d, sshRunners, secretsRes.secrets, guard(draw), 'uninstall') }, 'Gỡ agent'),
       can('operator') && h('button', { class: 'small danger', onclick: guard(async () => { await api('DELETE', `/api/devices/${d.id}`); draw(); }) }, 'Xoá'))));
 
   async function draw() {
@@ -683,7 +697,7 @@ async function viewNetwork(el) {
   fill(el,
     pageHead('Hạ tầng mạng',
       can('operator') && h('button', { class: 'primary', onclick: () => scanDialog(scanners, secretsRes.secrets, guard(draw)) }, '🔍 Quét mạng')),
-    h('p', { class: 'muted' }, 'Từ một agent đã cài, nền tảng quét các dải mạng mà máy đó nhìn thấy, liệt kê mọi thiết bị kèm thông tin (IP, MAC/hãng, hostname, cổng & dịch vụ, loại thiết bị, SNMP nếu có), và dựng sơ đồ theo từng VLAN. Bấm "Kết nối" ở mỗi thiết bị để cài agent từ xa và đưa vào quản lý.'),
+    h('p', { class: 'muted' }, 'Từ một agent đã cài, nền tảng quét các dải mạng mà máy đó nhìn thấy, liệt kê mọi thiết bị kèm thông tin (IP, MAC/hãng, hostname, cổng & dịch vụ, loại thiết bị, SNMP nếu có), và dựng sơ đồ theo từng VLAN. Bấm "Kết nối" ở mỗi thiết bị: máy chủ/PC thì cài agent để quản lý sâu, còn router/AP/IoT/điện thoại thì đưa vào giám sát không cần agent (theo dõi online, cổng, SNMP, cảnh báo khi sập).'),
     box);
   await draw();
   every(10000, guard(draw));
@@ -716,6 +730,59 @@ function scanDialog(scanners, secrets, onDone) {
   h('p', { class: 'muted' }, 'Quét chạy công khai từ agent đã cài, ghi vào nhật ký audit. Dải mạng lớn hơn /22 cần chỉ định cụ thể trong ô "Dải mạng".'),
   h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Bắt đầu quét')));
   const close = modal('Quét hạ tầng mạng', form);
+}
+
+// Heuristic: can we install an agent on this device, or only monitor it from outside?
+const OS_HINT = /server|linux|unix|windows|computer|workstation|máy chủ|\bpc\b|host|virtual|hypervisor|proxmox|esxi|raspberry/i;
+const NET_HINT = /gateway|router|switch|access|printer|camera|\biot\b|mobile|phone|ios|android|\btv\b|appliance|voip/i;
+function isInstallable(d) {
+  const t = d.device_type || '';
+  if (NET_HINT.test(t)) return false;
+  if (OS_HINT.test(t)) return true;
+  return (d.open_ports || []).some((p) => [22, 3389, 5985, 5986].includes(p.port));
+}
+
+// "Kết nối" works for every device. This chooser routes to the right management mode:
+// install an agent (servers/PCs) or monitor without an agent (routers, APs, IoT, phones).
+function connectDialog(device, agentRunners, probeRunners, secrets, onDone) {
+  const guess = isInstallable(device) ? 'agent' : 'agentless';
+  const btn = (mode, icon, title, desc) => h('button', {
+    type: 'button', class: 'choice' + (guess === mode ? ' primary' : ''),
+    style: 'display:block;width:100%;text-align:left;margin:6px 0;padding:12px;',
+    onclick: () => { close(); if (mode === 'agent') (agentRunners.length ? manageAgentDialog(device, agentRunners, secrets, onDone, 'install') : directInstallDialog(device, onDone)); else monitorDialog(device, probeRunners, secrets, onDone); },
+  }, h('strong', {}, `${icon} ${title}`), h('div', { class: 'muted small' }, desc));
+  const close = modal('Kết nối thiết bị', h('div', {},
+    h('p', {}, 'Thiết bị ', h('strong', { class: 'mono' }, device.ip), device.hostname ? ` (${device.hostname})` : '', ' — ', `${deviceTypeIcon(device.device_type)} ${device.device_type || 'không rõ'}`, '. Chọn cách đưa vào quản lý:'),
+    btn('agent', '🖥️', 'Cài agent', 'Máy chủ / PC Linux hoặc Windows. Quản lý sâu: chạy lệnh, bảo mật, cập nhật, chỉ số.'),
+    btn('agentless', '📡', 'Giám sát không cần agent', 'Router, switch, AP, camera, IoT, điện thoại — thiết bị không cài được phần mềm. Theo dõi online/cổng/SNMP và cảnh báo khi sập.'),
+    guess === 'agentless' ? h('p', { class: 'muted small' }, 'Gợi ý: thiết bị này giống thiết bị mạng nên mục "Giám sát" được tô sáng.') : null));
+}
+
+function monitorDialog(device, runners, secrets, onDone) {
+  if (!runners.length) return void toast('Cần một agent đang online để giám sát hộ thiết bị', true);
+  const runner = h('select', {}, runners.map((x) => h('option', { value: x.id, selected: x.id === device.scanner_server_id }, `${x.name} (${(x.platform || 'linux') === 'windows' ? 'Windows' : 'Linux'}, ${x.ip || x.id})`)));
+  const ports = h('input', { placeholder: 'để trống = bộ cổng phổ biến; vd: 80,443,161' });
+  const interval = h('select', {}, [['60', '1 phút'], ['300', '5 phút'], ['900', '15 phút'], ['3600', '1 giờ']].map(([v, l]) => h('option', { value: v, selected: v === '300' }, l)));
+  const snmp = h('select', {}, h('option', { value: '' }, '(không dùng SNMP)'), secrets.map((x) => h('option', { value: x.name }, x.name)));
+  const form = h('form', {
+    onsubmit: guard(async (e) => {
+      e.preventDefault();
+      const body = { scanner_server_id: runner.value, ports: ports.value.trim(), interval_sec: Number(interval.value) };
+      if (snmp.value) body.snmp_community_secret = snmp.value;
+      await api('POST', `/api/devices/${device.id}/monitor`, body);
+      close();
+      toast('Đã đưa vào giám sát — đang kiểm tra lần đầu…');
+      onDone();
+    }),
+  },
+  h('p', {}, 'Giám sát ', h('strong', { class: 'mono' }, device.ip), device.hostname ? ` (${device.hostname})` : '', ' mà không cài gì lên thiết bị. Một agent đã cài sẽ ping / kiểm tra cổng / hỏi SNMP định kỳ và cảnh báo khi thiết bị không phản hồi.'),
+  h('label', {}, 'Agent giám sát hộ'), runner,
+  h('label', {}, 'Chu kỳ kiểm tra'), interval,
+  h('label', {}, 'Cổng cần kiểm tra (tuỳ chọn)'), ports,
+  h('label', {}, 'SNMP community (tuỳ chọn, từ kho bí mật)'), snmp,
+  h('p', { class: 'muted small' }, 'Thiết bị sẽ hiện trạng thái online/offline và độ trễ ngay trong danh sách. Dừng bất cứ lúc nào bằng nút "Dừng giám sát".'),
+  h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Bắt đầu giám sát')));
+  const close = modal('Giám sát không cần agent', form);
 }
 
 function manageAgentDialog(device, scanners, secrets, onDone, defaultOp = 'install') {

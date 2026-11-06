@@ -194,6 +194,12 @@ const ADD_COLUMNS = [
   ['secrets', 'org_id', 'TEXT'],
   ['alerts', 'org_id', 'TEXT'],
   ['audit_log', 'org_id', 'TEXT'],
+  // agentless monitoring of devices that can't run an agent (routers, APs, IoT, phones)
+  ['scanned_devices', 'managed_mode', 'TEXT'],            // 'agent' | 'agentless'
+  ['scanned_devices', 'monitor_config', 'TEXT'],          // JSON: {ports:[], snmp_secret, interval_sec}
+  ['scanned_devices', 'monitor_state', 'TEXT'],           // JSON: {online, latency_ms, open_ports, hostname, snmp, checked_at}
+  ['scanned_devices', 'last_probe_at', 'TEXT'],
+  ['scanned_devices', 'next_probe_at', 'TEXT'],
 ];
 
 async function migrate(d, pg) {

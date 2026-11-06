@@ -49,6 +49,8 @@ function createApp(db) {
     vendor: d.vendor, hostname: d.hostname, device_type: d.device_type, subnet: d.subnet, vlan: d.vlan,
     open_ports: parseJson(d.open_ports, []), snmp: parseJson(d.snmp), is_gateway: !!d.is_gateway,
     managed_server_id: d.managed_server_id, status: d.status, first_seen: d.first_seen, last_seen: d.last_seen,
+    managed_mode: d.managed_mode || null, monitor_state: parseJson(d.monitor_state),
+    last_probe_at: d.last_probe_at || null, next_probe_at: d.next_probe_at || null,
   });
   const publicAssessment = (a) => a && ({
     id: a.id, server_id: a.server_id, score: a.score, counts: parseJson(a.counts, {}),
@@ -572,6 +574,90 @@ function createApp(db) {
     return { task: publicTask(await one('SELECT * FROM tasks WHERE id = ?', id)), scanner_server_id: scanner.id };
   });
 
+  // Pick an online agent that can run network probes/installs for this org. Prefers a runner that
+  // matches `preferPlatform`, falling back to any online runner advertising the capability.
+  async function pickRunner(orgId, capability, preferPlatform) {
+    const online = await all("SELECT * FROM servers WHERE org_id = ? AND status = 'online' ORDER BY last_seen_at DESC", orgId);
+    const able = online.filter((s) => {
+      let caps = s.agent_capabilities;
+      if (typeof caps === 'string') { try { caps = JSON.parse(caps); } catch { caps = []; } }
+      return Array.isArray(caps) && caps.includes(capability);
+    });
+    return able.find((s) => (s.platform || 'linux') === preferPlatform) || able[0] || null;
+  }
+
+  // Put a device that can't run an agent (router, AP, switch, IoT, phone) under *agentless*
+  // monitoring: a chosen agent probes it periodically (ping, open ports, SNMP) — nothing is
+  // installed on the device itself.
+  r.post('/api/devices/:id/monitor', requireUser('operator'), async (req, ctx) => {
+    const dev = await one('SELECT * FROM scanned_devices WHERE id = ? AND org_id = ?', ctx.params.id, ctx.orgId);
+    if (!dev) throw new HttpError(404, 'Không tìm thấy thiết bị');
+    if (!dev.ip) throw new HttpError(400, 'Thiết bị chưa có địa chỉ IP để giám sát');
+    const b = ctx.body || {};
+    const runner = b.scanner_server_id ? await getServer(b.scanner_server_id, ctx.orgId) : await pickRunner(ctx.orgId, 'net.probe', 'linux');
+    if (!runner) throw new HttpError(400, 'Cần một agent đang online để giám sát hộ thiết bị này');
+    if (runner.status === 'pending') throw new HttpError(409, 'Agent giám sát chưa kết nối');
+
+    let snmpRef = null;
+    if (typeof b.snmp_community === 'string' && b.snmp_community) snmpRef = await transientSecret(ctx.orgId, ctx.user.email, b.snmp_community);
+    else if (b.snmp_community_secret) { await assertSecret(b.snmp_community_secret, ctx.orgId); snmpRef = b.snmp_community_secret; }
+
+    const interval = Math.min(Math.max(Number(b.interval_sec) || 300, 60), 86400);
+    const ports = typeof b.ports === 'string' ? b.ports.slice(0, 256) : '';
+    const cfg = { scanner_server_id: runner.id, interval_sec: interval, ports, snmp_secret: snmpRef };
+    const nextAt = new Date(Date.now() + interval * 1000).toISOString();
+    await run('UPDATE scanned_devices SET status = ?, managed_mode = ?, scanner_server_id = ?, monitor_config = ?, next_probe_at = ? WHERE id = ?',
+      'managed', 'agentless', runner.id, JSON.stringify(cfg), nextAt, dev.id);
+    const task = await dispatchProbe(ctx.orgId, runner.id, dev, cfg, ctx.user.email);
+    await audit(ctx, 'device.monitor', dev.id, { host: dev.ip, scanner: runner.name, interval });
+    return { ok: true, scanner_server_id: runner.id, task: task ? publicTask(task) : null };
+  });
+
+  r.post('/api/devices/:id/unmonitor', requireUser('operator'), async (req, ctx) => {
+    const dev = await one('SELECT * FROM scanned_devices WHERE id = ? AND org_id = ?', ctx.params.id, ctx.orgId);
+    if (!dev) throw new HttpError(404, 'Không tìm thấy thiết bị');
+    // clean up any one-off SNMP secret we minted for the probe
+    const cfg = parseJson(dev.monitor_config, {});
+    if (cfg.snmp_secret && typeof cfg.snmp_secret === 'string' && cfg.snmp_secret.startsWith('__conn_')) {
+      await run('DELETE FROM secrets WHERE name = ? AND org_id = ?', cfg.snmp_secret, ctx.orgId).catch(() => {});
+    }
+    await run("UPDATE scanned_devices SET status = 'discovered', managed_mode = NULL, monitor_config = NULL, next_probe_at = NULL WHERE id = ?", dev.id);
+    await resolveAlert(`dev:${dev.id}:offline`);
+    await audit(ctx, 'device.unmonitor', dev.id, { host: dev.ip });
+    return { ok: true };
+  });
+
+  // Queue a net.probe for an agentless device on the given runner. Reuses the device's stored
+  // monitor_config (ports + optional SNMP community secret).
+  async function dispatchProbe(orgId, runnerId, dev, cfg, actor) {
+    const params = { host: dev.ip };
+    if (cfg.ports) params.ports = cfg.ports;
+    if (cfg.snmp_secret) params.snmp_community = { $secret: cfg.snmp_secret };
+    let clean;
+    try { clean = validateParams('net.probe', params); } catch (e) { if (e instanceof ValidationError) throw new HttpError(400, e.message); throw e; }
+    const id = sec.newId('tsk');
+    await run('INSERT INTO tasks (id, org_id, server_id, action, params, status, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      id, orgId, runnerId, 'net.probe', JSON.stringify(clean), 'queued', actor, now());
+    return one('SELECT * FROM tasks WHERE id = ?', id);
+  }
+
+  // Enqueue probes that have come due for agentless devices this runner is responsible for.
+  // Called on each heartbeat so monitoring runs without an external scheduler.
+  async function enqueueDueProbes(runner) {
+    const due = await all(
+      "SELECT * FROM scanned_devices WHERE org_id = ? AND managed_mode = 'agentless' AND scanner_server_id = ? AND (next_probe_at IS NULL OR next_probe_at <= ?)",
+      runner.org_id, runner.id, now());
+    for (const dev of due) {
+      const cfg = parseJson(dev.monitor_config, {});
+      // avoid piling up: skip if a probe for this device is already in flight
+      const inflight = await one("SELECT id FROM tasks WHERE server_id = ? AND action = 'net.probe' AND status IN ('queued','dispatched') AND params LIKE ?", runner.id, `%"${dev.ip}"%`);
+      const next = new Date(Date.now() + (Number(cfg.interval_sec) || 300) * 1000).toISOString();
+      await run('UPDATE scanned_devices SET next_probe_at = ? WHERE id = ?', next, dev.id);
+      if (inflight) continue;
+      try { await dispatchProbe(runner.org_id, runner.id, dev, cfg, 'system'); } catch (e) { console.error('probe enqueue failed', e.message); }
+    }
+  }
+
   // ------------------------------------------------------------------ security assessments & report
   r.get('/api/assessments', requireUser(), async (req, ctx) => {
     const servers = await all('SELECT id, name, platform, status FROM servers WHERE org_id = ? ORDER BY name', ctx.orgId);
@@ -751,6 +837,28 @@ function createApp(db) {
     await audit({ orgId, server }, 'net.scan_ingested', server.id, { devices: devices.length, subnets: subnets.length });
   }
 
+  // Ingest a net.probe result for an agentless device: store health state and raise/resolve an
+  // offline alert. Matches the device by IP within the probing agent's org.
+  async function ingestProbe(server, result) {
+    const orgId = server.org_id;
+    const dev = await one("SELECT * FROM scanned_devices WHERE org_id = ? AND ip = ? AND managed_mode = 'agentless'", orgId, result.host);
+    if (!dev) return;
+    const online = !!result.online;
+    const state = {
+      online, latency_ms: typeof result.latency_ms === 'number' ? result.latency_ms : null,
+      open_ports: Array.isArray(result.open_ports) ? result.open_ports.slice(0, 64) : [],
+      hostname: result.hostname || null, snmp: result.snmp && typeof result.snmp === 'object' ? result.snmp : null,
+      checked_at: now(),
+    };
+    const ports = state.open_ports.length ? JSON.stringify(state.open_ports) : dev.open_ports;
+    await run('UPDATE scanned_devices SET monitor_state = ?, last_probe_at = ?, open_ports = ?, hostname = COALESCE(?, hostname), snmp = COALESCE(?, snmp) WHERE id = ?',
+      JSON.stringify(state), now(), ports, result.hostname || null, state.snmp ? JSON.stringify(state.snmp) : null, dev.id);
+    const label = dev.hostname || result.host;
+    const key = `dev:${dev.id}:offline`;
+    if (online) await resolveAlert(key);
+    else await upsertAlert(orgId, dev.managed_server_id || null, key, 'warning', 'offline', `Thiết bị ${label} (${result.host}) không phản hồi`);
+  }
+
   r.post('/api/agent/enroll', async (req, ctx) => {
     const { token } = ctx.body;
     const t = token && await one('SELECT * FROM enrollment_tokens WHERE token_hash = ?', sec.sha256(token));
@@ -774,6 +882,7 @@ function createApp(db) {
 
   r.post('/api/agent/heartbeat', requireAgent, async (req, ctx) => {
     await applyAgentReport(ctx.server, ctx.body);
+    try { await enqueueDueProbes(ctx.server); } catch (e) { console.error('enqueueDueProbes failed', e.message); }
     const queued = await all("SELECT * FROM tasks WHERE server_id = ? AND status = 'queued' ORDER BY created_at LIMIT 5", ctx.server.id);
     const tasks = [];
     for (const t of queued) {
@@ -804,6 +913,9 @@ function createApp(db) {
     await audit(ctx, 'task.finished', t.id, { action: t.action, status, exit_code });
     if (t.action === 'net.scan' && status === 'succeeded' && result) {
       try { await ingestScan(ctx.server, result); } catch (e) { console.error('ingestScan failed', e); }
+    }
+    if (t.action === 'net.probe' && result && result.host) {
+      try { await ingestProbe(ctx.server, result); } catch (e) { console.error('ingestProbe failed', e); }
     }
     if ((t.action === 'net.remote_install' || t.action === 'net.remote_uninstall')) {
       // delete any one-off credential secrets minted for this task

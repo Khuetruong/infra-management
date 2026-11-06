@@ -57,6 +57,11 @@ const ACTIONS = {
     deep: { type: 'bool', default: false },
     snmp_community: { type: 'secret' },
   } },
+  'net.probe':            { category: 'network',  title: 'Giám sát thiết bị không agent', minRole: 'operator', platforms: ['linux', 'windows'], internal: true, params: {
+    host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
+    ports: { type: 'string', pattern: '[0-9, ]{0,256}' },
+    snmp_community: { type: 'secret' },
+  } },
   'net.remote_install':   { category: 'network',  title: 'Cài agent từ xa tới thiết bị', minRole: 'admin', destructive: true, platforms: ['linux', 'windows'], internal: true, params: {
     host: { type: 'string', pattern: `(${IPV4_CIDR})|(${IPV6_CIDR})`, required: true },
     os: { type: 'enum', values: ['linux', 'windows'], default: 'linux' },
