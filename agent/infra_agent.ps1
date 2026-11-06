@@ -178,19 +178,22 @@ function Resolve-Params {
     $s = $spec[$k]
     $v = if ($ph.Contains($k)) { $ph[$k] } else { $null }
     $skip = $false
-    switch ($s.type) {
+    # Use index access ($s['key']) for optional spec keys: under Set-StrictMode -Version 2.0,
+    # dot access to an absent key (e.g. $s.required on an optional string param) throws
+    # "property cannot be found". Index access returns $null safely.
+    switch ($s['type']) {
       'int' {
-        if ($null -eq $v) { $v = $s.default }
+        if ($null -eq $v) { $v = $s['default'] }
         $iv = 0
         if ($null -eq $v -or -not [int]::TryParse([string]$v, [ref]$iv)) { throw [Rejected]::new("invalid $k") }
         $v = $iv
-        if ($v -lt $s.min -or $v -gt $s.max) { throw [Rejected]::new("invalid $k") }
+        if ($v -lt $s['min'] -or $v -gt $s['max']) { throw [Rejected]::new("invalid $k") }
       }
-      'bool' { if ($null -eq $v) { $v = $s.default }; if ($v -isnot [bool]) { throw [Rejected]::new("invalid $k") } }
-      'enum' { if ($null -eq $v -or $v -eq '') { $v = $s.default }; if ($s.values -notcontains $v) { throw [Rejected]::new("invalid $k") } }
+      'bool' { if ($null -eq $v) { $v = $s['default'] }; if ($v -isnot [bool]) { throw [Rejected]::new("invalid $k") } }
+      'enum' { if ($null -eq $v -or $v -eq '') { $v = $s['default'] }; if ($s['values'] -notcontains $v) { throw [Rejected]::new("invalid $k") } }
       'string' {
-        if ($null -eq $v -or $v -eq '') { if ($s.required) { throw [Rejected]::new("invalid $k") } else { $skip = $true } }
-        elseif ([string]$v -notmatch $s.pattern) { throw [Rejected]::new("invalid $k") }
+        if ($null -eq $v -or $v -eq '') { if ($s['required']) { throw [Rejected]::new("invalid $k") } else { $skip = $true } }
+        elseif ([string]$v -notmatch $s['pattern']) { throw [Rejected]::new("invalid $k") }
         else { $v = [string]$v }
       }
       'secret' { if ($null -eq $v) { $skip = $true } elseif ($v -isnot [string]) { throw [Rejected]::new("invalid $k") } }
