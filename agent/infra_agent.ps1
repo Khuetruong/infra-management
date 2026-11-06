@@ -493,18 +493,25 @@ function Get-DeviceType($ports, $vendor, $hostname, $isGw) {
   return 'unknown'
 }
 
+# Byte-level math only: PowerShell -shl on a [uint32] like (192 -shl 24) overflows Int32 and
+# the subsequent [uint32] cast of the negative result THROWS, so the old shift math silently
+# failed for any 192.168/172.x address. BitConverter + per-byte masks avoid that entirely.
 function ConvertTo-NetworkCidr($cidr) {
   try {
     $parts = ([string]$cidr).Split('/')
     if ($parts.Count -ne 2) { return $null }
     $pfx = [int]$parts[1]
     if ($pfx -lt 0 -or $pfx -gt 32) { return $null }
-    $o = @($parts[0].Split('.') | ForEach-Object { [int]$_ })
-    if ($o.Count -ne 4) { return $null }
-    [uint32]$val = ([uint32]$o[0] -shl 24) -bor ([uint32]$o[1] -shl 16) -bor ([uint32]$o[2] -shl 8) -bor [uint32]$o[3]
-    if ($pfx -eq 0) { [uint32]$mask = 0 } else { [uint32]$mask = [uint32]((([uint64]0xFFFFFFFF) -shl (32 - $pfx)) -band [uint64]0xFFFFFFFF) }
-    [uint32]$net = $val -band $mask
-    return ('{0}.{1}.{2}.{3}/{4}' -f (($net -shr 24) -band 255), (($net -shr 16) -band 255), (($net -shr 8) -band 255), ($net -band 255), $pfx)
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip)) { return $null }
+    $b = $ip.GetAddressBytes()
+    if ($b.Length -ne 4) { return $null }
+    for ($i = 0; $i -lt 4; $i++) {
+      $bits = [Math]::Max(0, [Math]::Min(8, $pfx - ($i * 8)))
+      $mask = if ($bits -eq 0) { 0 } else { (0xFF -shl (8 - $bits)) -band 0xFF }
+      $b[$i] = [byte]($b[$i] -band $mask)
+    }
+    return ('{0}.{1}.{2}.{3}/{4}' -f $b[0], $b[1], $b[2], $b[3], $pfx)
   } catch { return $null }
 }
 
@@ -512,15 +519,18 @@ function Get-HostsInCidr($cidr, $cap) {
   $norm = ConvertTo-NetworkCidr $cidr
   if (-not $norm) { return @() }
   $parts = $norm.Split('/'); $pfx = [int]$parts[1]
-  $o = @($parts[0].Split('.') | ForEach-Object { [int]$_ })
-  [uint32]$net = ([uint32]$o[0] -shl 24) -bor ([uint32]$o[1] -shl 16) -bor ([uint32]$o[2] -shl 8) -bor [uint32]$o[3]
-  [uint32]$size = [uint32][math]::Pow(2, 32 - $pfx)
-  if ($pfx -le 30) { $start = 1; $end = [int]($size - 2) } else { $start = 0; $end = [int]($size - 1) }
-  if (($end - $start + 1) -gt [int]$cap) { return @() }
+  $ip = $null
+  if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip)) { return @() }
+  $nb = $ip.GetAddressBytes(); [array]::Reverse($nb)
+  [uint32]$net = [System.BitConverter]::ToUInt32($nb, 0)
+  [uint64]$size = [uint64][math]::Pow(2, 32 - $pfx)
+  if ($pfx -le 30) { [uint64]$startOff = 1; [uint64]$count = $size - 2 } else { [uint64]$startOff = 0; [uint64]$count = $size }
+  if ($count -gt [uint64]$cap) { return @() }
   $list = New-Object System.Collections.ArrayList
-  for ($i = $start; $i -le $end; $i++) {
-    [uint32]$a = $net + [uint32]$i
-    [void]$list.Add(('{0}.{1}.{2}.{3}' -f (($a -shr 24) -band 255), (($a -shr 16) -band 255), (($a -shr 8) -band 255), ($a -band 255)))
+  for ([uint64]$i = 0; $i -lt $count; $i++) {
+    [uint32]$a = [uint32]([uint64]$net + $startOff + $i)
+    $ab = [System.BitConverter]::GetBytes($a); [array]::Reverse($ab)
+    [void]$list.Add(('{0}.{1}.{2}.{3}' -f $ab[0], $ab[1], $ab[2], $ab[3]))
   }
   return $list
 }
